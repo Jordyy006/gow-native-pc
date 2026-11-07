@@ -1,18 +1,19 @@
-Patch 59: Direct3D 11 renderer for the native GS (Windows), selected with PS2X_GS_BACKEND=d3d11 (default stays OpenGL).
+Patch 59: Direct3D 11 renderer for the native GS (Windows). PS2X_GS_BACKEND=d3d11 selects it, =opengl forces OpenGL; unset it is
+chosen automatically when the driver has no OpenGL 4.3 core context (Intel HD 4000 stops at 4.0), else OpenGL as before.
 New GSHwD3D11Backend (gs_hw_d3d11.cpp/.h): the same render-target design as GSHwBackend (scaled RGBA targets, PS2 draws as
 triangles/sprites/lines, shader-side texture decode, CLUT, depth, alpha/dual-source blend, 16-bit shuffles, composed read
 circuits) on D3D11 feature level 11.0 + HLSL 5.0 compiled at run time with d3dcompiler_47.dll (no SDK dependency beyond
 d3d11). The frame is read back to the host as RGBA (UsesSharedPresentation() is false), so it shares the host path of the
 non-shared OpenGL mode. If no device or compiler exists, Probe() fails and MakeDefault() falls back to OpenGL.
-Debug aids: GOW_GS_D3D11_DEBUG=1 (D3D11 debug layer messages after each present), GOW_GS_D3D11_WARP=1 (software WARP device, CI tests only), GOW_GS_HW_STATS=1, PS2X_GS_HW_SCALE.
+Debug aids: GOW_GS_D3D11_DEBUG=1 (D3D11 debug layer messages after each present), GOW_GS_D3D11_WARP=1 (software WARP device, CI tests only), GOW_FORCE_NO_GL43=1 (test: pretend there is no OpenGL 4.3), GOW_GS_HW_STATS=1, PS2X_GS_HW_SCALE.
 Not in this backend yet: PCSX2 texture packs (patch 52) and the GL-only shared presentation. Test without the game:
 tools/test/d3d11_backend_test.cpp. Origin: this project, modelled on the Tenkaichi3Decomp renderer split (gs_d3d11.cpp).
 
 diff --git a/PS2Recomp/ps2xRuntime/CMakeLists.txt b/PS2Recomp/ps2xRuntime/CMakeLists.txt
-index 4564d5c..5d913d2 100644
+index 1e7067d..0ba474b 100644
 --- a/PS2Recomp/ps2xRuntime/CMakeLists.txt
 +++ b/PS2Recomp/ps2xRuntime/CMakeLists.txt
-@@ -583,7 +583,9 @@ set_source_files_properties(
+@@ -558,7 +558,9 @@ set_source_files_properties(
  target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg libmpeg2 ps2_iop)
  if(WIN32)
      # GOW-Port: WGL propio del hilo GS.
@@ -25,10 +26,10 @@ index 4564d5c..5d913d2 100644
      PRIVATE
 diff --git a/PS2Recomp/ps2xRuntime/include/runtime/gs/gs_hw_d3d11.h b/PS2Recomp/ps2xRuntime/include/runtime/gs/gs_hw_d3d11.h
 new file mode 100644
-index 0000000..aca86a3
+index 0000000..7e24c73
 --- /dev/null
 +++ b/PS2Recomp/ps2xRuntime/include/runtime/gs/gs_hw_d3d11.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,49 @@
 +// GOW-Port: Direct3D 11 variant of the native GS renderer (see gs_hw_backend.h). It rasterises the same PS2 draws into
 +// scaled RGBA render targets, decodes textures from the uploaded bytes and composes the two read circuits on the GPU,
 +// then hands the composed frame to the host as tightly packed RGBA pixels. Selected with PS2X_GS_BACKEND=d3d11.
@@ -46,6 +47,10 @@ index 0000000..aca86a3
 +
 +    // True when a D3D11 device and d3dcompiler_47.dll can be created on this machine (used to fall back to OpenGL).
 +    static bool Probe();
++
++    // True when the driver can create an OpenGL 4.3 core context (what the OpenGL GS renderer needs); used to pick Direct3D 11
++    // automatically on machines without it. The thread's current OpenGL context is left as it was.
++    static bool GlCore43Available();
 +
 +    void Initialize(uint8_t *vram, uint32_t vramSize) override;
 +    void Reset() override;
@@ -76,10 +81,10 @@ index 0000000..aca86a3
 +};
 diff --git a/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp b/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp
 new file mode 100644
-index 0000000..1b07bf4
+index 0000000..154fc99
 --- /dev/null
 +++ b/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp
-@@ -0,0 +1,3263 @@
+@@ -0,0 +1,3309 @@
 +// GOW-Port: Direct3D 11 variant of the native GS renderer (see gs_hw_backend.cpp). Same PS2 draw translation into
 +// scaled RGBA render targets, CPU texture decode and CLUT store reuse; the rasteriser, blend, depth and composition
 +// are D3D11. Selected with PS2X_GS_BACKEND=d3d11; the host always reads the composed frame back.
@@ -3202,6 +3207,52 @@ index 0000000..1b07bf4
 +    return true;
 +}
 +
++bool GSHwD3D11Backend::GlCore43Available()
++{
++    if (std::getenv("GOW_FORCE_NO_GL43")) // test switch: behave as a driver without OpenGL 4.3
++        return false;
++    using CreateContextAttribs = HGLRC(WINAPI *)(HDC, HGLRC, const int *);
++    const HGLRC previousContext = wglGetCurrentContext();
++    const HDC previousDc = wglGetCurrentDC();
++    bool ok = false;
++    HWND window = CreateWindowExA(0, "STATIC", "gow-gl-probe", WS_OVERLAPPED, 0, 0, 8, 8, nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
++    HDC dc = window ? GetDC(window) : nullptr;
++    if (dc)
++    {
++        PIXELFORMATDESCRIPTOR pfd{};
++        pfd.nSize = sizeof(pfd);
++        pfd.nVersion = 1;
++        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
++        pfd.iPixelType = PFD_TYPE_RGBA;
++        pfd.cColorBits = 32;
++        const int format = ChoosePixelFormat(dc, &pfd);
++        HGLRC legacy = (format && SetPixelFormat(dc, format, &pfd)) ? wglCreateContext(dc) : nullptr;
++        if (legacy && wglMakeCurrent(dc, legacy))
++        {
++            const auto createAttribs = reinterpret_cast<CreateContextAttribs>(wglGetProcAddress("wglCreateContextAttribsARB"));
++            if (createAttribs)
++            {
++                const int attributes[] = {0x2091, 4, 0x2092, 3, 0x9126, 1, 0}; // major 4, minor 3, core profile
++                if (HGLRC core = createAttribs(dc, nullptr, attributes))
++                {
++                    ok = true;
++                    wglDeleteContext(core);
++                }
++            }
++        }
++        wglMakeCurrent(nullptr, nullptr);
++        if (legacy)
++            wglDeleteContext(legacy);
++    }
++    if (dc)
++        ReleaseDC(window, dc);
++    if (window)
++        DestroyWindow(window);
++    if (previousContext)
++        wglMakeCurrent(previousDc, previousContext);
++    return ok;
++}
++
 +void GSHwD3D11Backend::Initialize(uint8_t *vram, uint32_t vramSize)
 +{
 +    m_impl->vram = vram;
@@ -3344,7 +3395,7 @@ index 0000000..1b07bf4
 +}
 +// __REST_MARKER__
 diff --git a/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
-index e2d97b2..d1c2609 100644
+index 10338ba..2d0b347 100644
 --- a/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
 +++ b/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
 @@ -2,6 +2,7 @@
@@ -3355,15 +3406,23 @@ index e2d97b2..d1c2609 100644
  #include "runtime/gs/gs_shared_present.h"
  #include "gs_inventory.h"
  #include "ThreadPriority.h"
-@@ -84,6 +85,17 @@ GSThreadedBackend::~GSThreadedBackend()
+@@ -84,6 +85,25 @@ GSThreadedBackend::~GSThreadedBackend()
  std::unique_ptr<GSRasterBackend> GSThreadedBackend::MakeDefault()
  {
      // GOW-Port: the native render-target renderer is the only GS renderer (no VRAM-emulating rasteriser).
-+    // gow-native-pc (patch 59): PS2X_GS_BACKEND=d3d11 selects the Direct3D 11 variant when a device and d3dcompiler can be
-+    // created, else OpenGL.
++    // gow-native-pc (patch 59): PS2X_GS_BACKEND=d3d11 selects the Direct3D 11 variant, =opengl forces OpenGL. Unset (or
++    // =auto), OpenGL is used unless the driver has no OpenGL 4.3 core context: then Direct3D 11. If Direct3D 11 cannot
++    // start (no device or d3dcompiler), OpenGL is used.
 +#ifdef _WIN32
 +    const char *backend = std::getenv("PS2X_GS_BACKEND");
-+    if (backend && (*backend == 'd' || *backend == 'D'))
++    const char kind = backend ? *backend : 0;
++    bool wantD3d11 = kind == 'd' || kind == 'D';
++    if (!wantD3d11 && (kind == 0 || kind == 'a' || kind == 'A') && !GSHwD3D11Backend::GlCore43Available())
++    {
++        std::fprintf(stderr, "[gs-hw] OpenGL 4.3 core context unavailable: using Direct3D 11\n");
++        wantD3d11 = true;
++    }
++    if (wantD3d11)
 +    {
 +        if (GSHwD3D11Backend::Probe())
 +            return std::make_unique<GSThreadedBackend>(std::make_unique<GSHwD3D11Backend>());
