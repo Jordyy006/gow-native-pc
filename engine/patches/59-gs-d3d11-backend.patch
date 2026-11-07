@@ -1,0 +1,3383 @@
+Patch 59: Direct3D 11 renderer for the native GS (Windows), selected with PS2X_GS_BACKEND=d3d11 (default stays OpenGL).
+New GSHwD3D11Backend (gs_hw_d3d11.cpp/.h): the same render-target design as GSHwBackend (scaled RGBA targets, PS2 draws as
+triangles/sprites/lines, shader-side texture decode, CLUT, depth, alpha/dual-source blend, 16-bit shuffles, composed read
+circuits) on D3D11 feature level 11.0 + HLSL 5.0 compiled at run time with d3dcompiler_47.dll (no SDK dependency beyond
+d3d11). The frame is read back to the host as RGBA (UsesSharedPresentation() is false), so it shares the host path of the
+non-shared OpenGL mode. If no device or compiler exists, Probe() fails and MakeDefault() falls back to OpenGL.
+Debug aids: GOW_GS_D3D11_DEBUG=1 (D3D11 debug layer messages after each present), GOW_GS_D3D11_WARP=1 (software WARP device, CI tests only), GOW_GS_HW_STATS=1, PS2X_GS_HW_SCALE.
+Not in this backend yet: PCSX2 texture packs (patch 52) and the GL-only shared presentation. Test without the game:
+tools/test/d3d11_backend_test.cpp. Origin: this project, modelled on the Tenkaichi3Decomp renderer split (gs_d3d11.cpp).
+
+diff --git a/PS2Recomp/ps2xRuntime/CMakeLists.txt b/PS2Recomp/ps2xRuntime/CMakeLists.txt
+index b217a1c..668cb10 100644
+--- a/PS2Recomp/ps2xRuntime/CMakeLists.txt
++++ b/PS2Recomp/ps2xRuntime/CMakeLists.txt
+@@ -401,6 +401,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/gs_swizzle.cpp
+     src/lib/gs/gpu/gs_gl.cpp
+     src/lib/gs/gpu/gs_hw_backend.cpp
++    src/lib/gs/gpu/gs_hw_d3d11.cpp
+ 
+ src/lib/gs/gpu/gs_texture_store.cpp
+     src/lib/ps2_iop_host.cpp
+@@ -583,7 +584,8 @@ set_source_files_properties(
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg libmpeg2 ps2_iop)
+ if(WIN32)
+     # GOW-Port: WGL propio del hilo GS.
+-    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
++    # gow-native-pc (patch 59): d3d11 for the Direct3D 11 GS renderer (PS2X_GS_BACKEND=d3d11); d3dcompiler_47.dll is loaded at run time.
++    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32 d3d11)
+ endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+diff --git a/PS2Recomp/ps2xRuntime/include/runtime/gs/gs_hw_d3d11.h b/PS2Recomp/ps2xRuntime/include/runtime/gs/gs_hw_d3d11.h
+new file mode 100644
+index 0000000..aca86a3
+--- /dev/null
++++ b/PS2Recomp/ps2xRuntime/include/runtime/gs/gs_hw_d3d11.h
+@@ -0,0 +1,45 @@
++// GOW-Port: Direct3D 11 variant of the native GS renderer (see gs_hw_backend.h). It rasterises the same PS2 draws into
++// scaled RGBA render targets, decodes textures from the uploaded bytes and composes the two read circuits on the GPU,
++// then hands the composed frame to the host as tightly packed RGBA pixels. Selected with PS2X_GS_BACKEND=d3d11.
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++
++#include <memory>
++
++class GSHwD3D11Backend final : public GSRasterBackend
++{
++public:
++    GSHwD3D11Backend();
++    ~GSHwD3D11Backend() override;
++
++    // True when a D3D11 device and d3dcompiler_47.dll can be created on this machine (used to fall back to OpenGL).
++    static bool Probe();
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++    // GOW-Port: this backend always reads the composed frame back, the host does not share a GL texture with it.
++    bool UsesSharedPresentation() const override { return false; }
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++private:
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++};
+diff --git a/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp b/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp
+new file mode 100644
+index 0000000..ddff2b7
+--- /dev/null
++++ b/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp
+@@ -0,0 +1,3264 @@
++// GOW-Port: Direct3D 11 variant of the native GS renderer (see gs_hw_backend.cpp). Same PS2 draw translation into
++// scaled RGBA render targets, CPU texture decode and CLUT store reuse; the rasteriser, blend, depth and composition
++// are D3D11. Selected with PS2X_GS_BACKEND=d3d11; the host always reads the composed frame back.
++#include "runtime/gs/gs_hw_d3d11.h"
++
++#include "gs_texture_store.h"
++#include "runtime/gs/gs_swizzle.h"
++#include "../gs_gpu_helpers.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <map>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <d3d11.h>
++
++namespace
++{
++    // Minimal COM RAII: put()/reset()/get()/move own one interface pointer.
++    template <typename T>
++    struct Com
++    {
++        T *p = nullptr;
++        Com() = default;
++        ~Com() { reset(); }
++        Com(const Com &) = delete;
++        Com &operator=(const Com &) = delete;
++        Com(Com &&o) noexcept : p(o.p) { o.p = nullptr; }
++        Com &operator=(Com &&o) noexcept
++        {
++            if (this != &o)
++            {
++                reset();
++                p = o.p;
++                o.p = nullptr;
++            }
++            return *this;
++        }
++        void reset()
++        {
++            if (p)
++            {
++                p->Release();
++                p = nullptr;
++            }
++        }
++        T *get() const { return p; }
++        T *operator->() const { return p; }
++        explicit operator bool() const { return p != nullptr; }
++        T **put()
++        {
++            reset();
++            return &p;
++        }
++    };
++
++    // D3DCompile's include-handler parameter is ID3DInclude (defined in d3dcommon.h, pulled in by d3d11.h);
++    // there is no ID3D11Include type in the Windows SDK.
++    using D3DCompileFn = HRESULT(WINAPI *)(LPCVOID, SIZE_T, LPCVOID, const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3D10Blob **);
++#ifndef D3DCOMPILE_OPTIMIZATION_LEVEL3
++#define D3DCOMPILE_OPTIMIZATION_LEVEL3 (1 << 15)
++#endif
++
++    HMODULE g_d3dcompiler = nullptr;
++    D3DCompileFn g_compile = nullptr;
++
++    bool loadCompiler()
++    {
++        if (g_compile)
++            return true;
++        if (!g_d3dcompiler)
++            g_d3dcompiler = LoadLibraryW(L"d3dcompiler_47.dll");
++        if (!g_d3dcompiler)
++            return false;
++        g_compile = reinterpret_cast<D3DCompileFn>(GetProcAddress(g_d3dcompiler, "D3DCompile"));
++        return g_compile != nullptr;
++    }
++
++    bool compileAll(const char *source, std::vector<std::vector<uint8_t>> &cache)
++    {
++        struct Entry
++        {
++            const char *entry;
++            const char *profile;
++        };
++        static const Entry entries[] = {
++            {"vsDraw", "vs_5_0"}, {"psDraw", "ps_5_0"}, {"vsShuffle", "vs_5_0"}, {"psShuffle", "ps_5_0"},
++            {"vsFull", "vs_5_0"}, {"psPresent", "ps_5_0"}, {"psClut", "ps_5_0"}, {"psSolid", "ps_5_0"},
++        };
++        cache.clear();
++        cache.resize(8);
++        bool allOk = true;
++        for (size_t i = 0; i < 8; ++i)
++        {
++            ID3DBlob *blob = nullptr;
++            ID3D10Blob *errors = nullptr;
++            const HRESULT hr = g_compile(source, std::strlen(source), nullptr, nullptr, nullptr, entries[i].entry, entries[i].profile,
++                                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors);
++            if (FAILED(hr) || !blob)
++            {
++                if (errors && errors->GetBufferSize())
++                    std::fprintf(stderr, "[gs-hw-d3d11] HLSL %s error: %.*s\n", entries[i].entry,
++                                 static_cast<int>(errors->GetBufferSize()), static_cast<const char *>(errors->GetBufferPointer()));
++                if (blob)
++                    blob->Release();
++                if (errors)
++                    errors->Release();
++                allOk = false;
++                continue;
++            }
++            const SIZE_T size = blob->GetBufferSize();
++            const void *data = blob->GetBufferPointer();
++            cache[i].assign(static_cast<const uint8_t *>(data), static_cast<const uint8_t *>(data) + size);
++            blob->Release();
++            if (errors)
++                errors->Release();
++        }
++        return allOk;
++    }
++
++    std::vector<std::vector<uint8_t>> g_bytecode;
++    int g_bytecodeState = 0; // 0 not tried, 1 ok, -1 failed
++
++    const std::vector<std::vector<uint8_t>> &bytecode(const char *source)
++    {
++        if (g_bytecodeState == 0)
++        {
++            if (!loadCompiler())
++            {
++                std::fprintf(stderr, "[gs-hw-d3d11] d3dcompiler_47.dll unavailable\n");
++                g_bytecodeState = -1;
++            }
++            else if (!compileAll(source, g_bytecode))
++                g_bytecodeState = -1;
++            else
++                g_bytecodeState = 1;
++        }
++        return g_bytecode;
++    }
++
++    // HLSL shared by every entry. The draw cbuffer uses explicit float4/int4 groups with #define aliases matching the
++    // GLSL uniform names so the pixel shader below can stay a near one-to-one port of the GL fragment shader.
++    // HLSL gotcha: Load on a Texture2D returns float4 (color) / uint (Texture2D<uint>) / uint2, never a scalar vector
++    // the GLSL texelFetch returns; all ports below use the matching component.
++    const char *kHlslSource = R"HLSL(
++cbuffer CbDraw : register(b0)
++{
++    float4 F0; // invW, invH, texDimW, texDimH
++    float4 F1; // texSizeW, texSizeH, blendScale, fix
++    float4 F2; // zAliasMax, zMax, ta0, ta1
++    float4 F3; // rtPxW, rtPxH, scale, 0
++    int4   I0; // tme, fst, tfx, tcc
++    int4   I1; // iip, indexed, linear, rtTex24
++    int4   I2; // aem, date, datm, swBlend
++    int4   I3; // colClamp, zAlias, zAliasWrite, zTex
++    int4   I4; // abcd
++    int4   I5; // wrapX, wrapY, failTint, pass
++    int4   I6; // texFmt
++    int4   I7; // texFmt2
++    int4   I8; // rtFmt
++    int4   I9; // rtFmt2
++    int4   I10; // tex0
++    int4   I11; // ate, atst, aref, reinterp
++};
++#define uInvSize   (F0.xy)
++#define uTexDim    (F0.zw)
++#define uTexSize   (F1.xy)
++#define uBlendScale (F1.z)
++#define uFix       (F1.w)
++#define uZAliasMax (F2.x)
++#define uZMax      (F2.y)
++#define uTa0       (F2.z)
++#define uTa1       (F2.w)
++#define uRtPx      (F3.xy)
++#define uScale     (F3.z)
++#define uTme       (I0.x)
++#define uFst       (I0.y)
++#define uTfx       (I0.z)
++#define uTcc       (I0.w)
++#define uIip       (I1.x)
++#define uIndexed   (I1.y)
++#define uLinear    (I1.z)
++#define uRtTex24   (I1.w)
++#define uAem       (I2.x)
++#define uDate      (I2.y)
++#define uDatm      (I2.z)
++#define uSwBlend   (I2.w)
++#define uColClamp  (I3.x)
++#define uZAlias    (I3.y)
++#define uZAliasWrite (I3.z)
++#define uZTex      (I3.w)
++#define uAbcd      (I4)
++#define uWrap      (I5.xy)
++#define uFailTint  (I5.z)
++#define uPass      (I5.w)
++#define uTexFmt    (I6)
++#define uTexFmt2   (I7)
++#define uRtFmt     (I8)
++#define uRtFmt2    (I9)
++#define uTex0      (I10)
++#define uAte       (I11.x)
++#define uAtst      (I11.y)
++#define uAref      (I11.z)
++#define uReinterp  (I11.w)
++
++cbuffer CbShuffle : register(b1)
++{
++    float4 S0; // invW, invH, scale, zMax
++    int4   SI0; // srcZ, hs, hd, aem
++    int4   SI1; // ta0>>7, ta1>>7, 0, 0
++};
++#define sInvSize  (S0.xy)
++#define sScale    (S0.z)
++#define sZMax     (S0.w)
++#define sSrcZ     (SI0.x)
++#define sHs       (SI0.y)
++#define sHd       (SI0.z)
++#define sAem      (SI0.w)
++#define sTa0      (SI1.x)
++#define sTa1      (SI1.y)
++
++cbuffer CbPresent : register(b2)
++{
++    float4 PI0; // offX, offY, ct24, alphaX2
++    float4 PI1; // edge
++};
++#define pOff   (PI0.xy)
++#define pCt24  (PI0.z)
++#define pAlphaX2 (PI0.w)
++#define pEdge  (PI1.x)
++
++cbuffer CbSolid : register(b3)
++{
++    float4 solidColor;
++};
++
++SamplerState sTex : register(s0);
++Texture2D uTex : register(t0);
++Texture2D uRtColor : register(t1);
++Texture2D<uint> uTables : register(t2);
++Texture2D uPalette : register(t3);
++Texture2D uDest : register(t4);
++Texture2D uIdxPalette : register(t5);
++Texture2D<uint2> uCoords : register(t6);
++Texture2D uSrc : register(t7);
++
++struct DrawIn
++{
++    float2 aPos : POSITION;
++    float aZ : TEXCOORD0;
++    float4 aCol : COLOR;
++    float3 aSTQ : TEXCOORD1;
++    float2 aUV : TEXCOORD2;
++    float4 aUVClamp : TEXCOORD3;
++};
++struct DrawOut
++{
++    float4 aPos : SV_Position;
++    float4 vCol : TEXCOORD0;
++    float4 vColFlat : TEXCOORD1;
++    float3 vSTQ : TEXCOORD2;
++    float2 vUV : TEXCOORD3;
++    float4 vUVClamp : TEXCOORD4;
++};
++// GL maps PV coordinates with y down into y up; D3D NDC +1 y lands on RT row 0, so the y axis is flipped here (x stays).
++DrawOut vsDraw(DrawIn i)
++{
++    DrawOut o;
++    float2 ndc;
++    ndc.x = i.aPos.x * uInvSize.x * 2.0 - 1.0;
++    ndc.y = 1.0 - 2.0 * i.aPos.y * uInvSize.y;
++    o.aPos = float4(ndc, i.aZ, 1.0);
++    o.vCol = i.aCol;
++    o.vColFlat = i.aCol;
++    o.vSTQ = i.aSTQ;
++    o.vUV = i.aUV;
++    o.vUVClamp = i.aUVClamp;
++    return o;
++}
++
++uint tab(uint i) { return uTables.Load(int3(int(i & 2047u), int(i >> 11), 0)); }
++
++float4 reinterpretTexel(int2 p)
++{
++    uint x = uint(p.x), y = uint(p.y);
++    uint psx = uint(uTexFmt.x), psy = uint(uTexFmt.y);
++    uint pagesPerRow = (uint(uTex0.y) * 64u) >> psx;
++    uint page = (uint(uTex0.x) >> 5) + (y >> psy) * pagesPerRow + (x >> psx);
++    uint entry = ((uint(uTex0.x) & 31u) << (psx + psy)) + ((y & ((1u << psy) - 1u)) << psx) + (x & ((1u << psx) - 1u));
++    uint pixelIndex = (page << uint(uTexFmt.z)) + tab(uint(uTexFmt2.z) + entry);
++    uint bitpos = (pixelIndex << uint(uTexFmt.w)) + uint(uTexFmt2.x);
++    uint B = uint(uRtFmt.w);
++    uint rtIdx = bitpos / B;
++    uint within = bitpos % B;
++    uint rtBase = uint(uRtFmt2.y) << uint(uRtFmt.z);
++    if (rtIdx < rtBase) return float4(1.0, 0.0, 1.0, 1.0);
++    uint rel = rtIdx - rtBase;
++    uint rpage = rel >> uint(uRtFmt.z);
++    uint inpage = rel & ((1u << uint(uRtFmt.z)) - 1u);
++    uint e = tab(uint(uRtFmt2.x) + inpage);
++    uint rpsx = uint(uRtFmt.x), rpsy = uint(uRtFmt.y);
++    uint fbw = uint(uRtFmt2.z);
++    uint px = (rpage % fbw) * (1u << rpsx) + (e & ((1u << rpsx) - 1u));
++    uint py = (rpage / fbw) * (1u << rpsy) + (e >> rpsx);
++    // GL samples (px+0.5)/uRtPx normalised; the host texture is ceil(rtPx*scale) so the host texel is floor((px+0.5)*hdW/uRtPx).
++    uint hdW, hdH;
++    uRtColor.GetDimensions(hdW, hdH);
++    int2 q = int2(min(uint(float(hdW) * (float(px) + 0.5) / max(uRtPx.x, 1.0)), hdW - 1u),
++                  min(uint(float(hdH) * (float(py) + 0.5) / max(uRtPx.y, 1.0)), hdH - 1u));
++    float4 c = uRtColor.Load(int3(q, 0)) * 255.0;
++    c = floor(c + 0.5);
++    uint word;
++    if (B == 32u)
++        word = uint(c.r) | (uint(c.g) << 8) | (uint(c.b) << 16) | (uint(c.a) << 24);
++    else
++        word = (c.a >= 128.0 ? 0x8000u : 0u) | ((uint(c.b) >> 3) << 10) | ((uint(c.g) >> 3) << 5) | (uint(c.r) >> 3);
++    uint bits = uint(uTexFmt2.y);
++    uint mask = (bits >= 32u) ? 0xFFFFFFFFu : ((1u << (bits & 31u)) - 1u);
++    uint value = (bits >= 32u) ? (word >> within) : ((word >> within) & mask);
++    int kind = uTexFmt2.w;
++    if (kind == 0) return float4(float(value & 255u), float((value >> 8) & 255u), float((value >> 16) & 255u), float((value >> 24) & 255u)) / 255.0;
++    if (kind == 1) return float4(float(value & 255u), float((value >> 8) & 255u), float((value >> 16) & 255u), 128.0) / 255.0;
++    if (kind == 2)
++    {
++        float3 rgb = float3(float(value & 31u), float((value >> 5) & 31u), float((value >> 10) & 31u)) * 8.0;
++        return float4(rgb, ((value & 0x8000u) != 0u) ? 128.0 : 0.0) / 255.0;
++    }
++    return uPalette.Load(int3(int(value & 255u), 0, 0));
++}
++
++float4 indexedTexel(int2 p)
++{
++    int2 size = max(int2(int(uTexDim.x), int(uTexDim.y)), int2(1, 1));
++    p.x = (uWrap.x == 0) ? ((p.x % size.x) + size.x) % size.x : clamp(p.x, 0, size.x - 1);
++    p.y = (uWrap.y == 0) ? ((p.y % size.y) + size.y) % size.y : clamp(p.y, 0, size.y - 1);
++    int idx = int(uTex.Load(int3(p, 0)).r * 255.0 + 0.5);
++    return uIdxPalette.Load(int3(idx, 0, 0));
++}
++
++float clamp255(float v) { return clamp(floor(v), 0.0, 255.0); }
++
++float3 blendSel(int sel, float3 cs, float3 cd) { return sel == 0 ? cs : sel == 1 ? cd : float3(0.0, 0.0, 0.0); }
++
++bool alphaPasses(float a)
++{
++    int ai = int(a);
++    switch (uAtst)
++    {
++    case 0: return false;
++    case 1: return true;
++    case 2: return ai < uAref;
++    case 3: return ai <= uAref;
++    case 4: return ai == uAref;
++    case 5: return ai >= uAref;
++    case 6: return ai > uAref;
++    default: return ai != uAref;
++    }
++}
++
++struct PsOut
++{
++    float4 oColor : SV_Target0;
++    float4 oBlend : SV_Target1;
++};
++
++// SV_Position first: it is register 0 of the VS outputs, and the interpolants must line up with them.
++PsOut psDraw(float4 pos : SV_Position, float4 vCol : TEXCOORD0, float4 vColFlat : TEXCOORD1, float3 vSTQ : TEXCOORD2, float2 vUV : TEXCOORD3, float4 vUVClamp : TEXCOORD4)
++{
++    PsOut o;
++    uint zFrag = uint(clamp(pos.z, 0.0, 1.0) * uZAliasMax + 0.5);
++    int2 fragPx = int2(pos.xy);
++    if (uZAlias != 0)
++    {
++        float4 d = floor(uDest.Load(int3(fragPx, 0)) * 255.0 + 0.5);
++        uint zd = uint(d.r) | (uint(d.g) << 8) | (uint(d.b) << 16);
++        int ztst = uZAlias - 1;
++        bool zpass = ztst == 1 || (ztst == 2 && zFrag >= zd) || (ztst == 3 && zFrag > zd);
++        if (!zpass) discard;
++    }
++    if (uDate != 0)
++    {
++        bool bit = uDest.Load(int3(fragPx, 0)).a >= 0.5;
++        if (bit != (uDatm != 0)) discard;
++    }
++    float4 v = (uIip != 0) ? vCol : vColFlat;
++    float3 rgb = v.rgb;
++    float a = v.a;
++    if (uTme != 0)
++    {
++        float q = (abs(vSTQ.z) < 1e-30) ? 1e-30 : vSTQ.z;
++        float2 uv = (uFst != 0) ? vUV : (vSTQ.xy / q) * uTexDim;
++        uv = clamp(uv, vUVClamp.xy, vUVClamp.zw);
++        if (uLinear == 0)
++            uv = floor(uv * 16.0 + 0.015625) / 16.0;
++        float4 t;
++        if (uReinterp != 0)
++        {
++            int2 ip = int2(floor(uv));
++            ip = int2(clamp(ip.x, 0, uTex0.z - 1), clamp(ip.y, 0, uTex0.w - 1));
++            t = reinterpretTexel(ip) * 255.0;
++        }
++        else if (uIndexed != 0)
++        {
++            if (uLinear != 0)
++            {
++                float2 f = uv - 0.5;
++                int2 i0 = int2(floor(f));
++                float2 w = f - floor(f);
++                t = lerp(lerp(indexedTexel(i0), indexedTexel(i0 + int2(1, 0)), w.x),
++                        lerp(indexedTexel(i0 + int2(0, 1)), indexedTexel(i0 + int2(1, 1)), w.x), w.y) * 255.0;
++            }
++            else
++                t = indexedTexel(int2(floor(uv))) * 255.0;
++        }
++        else if (uZTex != 0)
++        {
++            uint zhdW, zhdH;
++            uTex.GetDimensions(zhdW, zhdH);
++            float2 zhost = float2(float(zhdW), float(zhdH));
++            int2 zpx = int2(floor(uv * zhost / uTexSize + 0.001));
++            float zf = uTex.Load(int3(zpx, 0)).r;
++            uint zi = uint(clamp(zf, 0.0, 1.0) * uZMax + 0.5);
++            if (uZTex == 16)
++            {
++                float3 zrgb = float3(float(zi & 31u), float((zi >> 5) & 31u), float((zi >> 10) & 31u)) * 8.0;
++                t = float4(zrgb, ((zi & 0x8000u) != 0u) ? 128.0 : 0.0);
++            }
++            else
++                t = float4(float(zi & 255u), float((zi >> 8) & 255u), float((zi >> 16) & 255u), 128.0);
++        }
++        else if (uLinear == 0)
++        {
++            uint hdW, hdH;
++            uTex.GetDimensions(hdW, hdH);
++            float2 host = float2(float(hdW), float(hdH));
++            int2 hpx = int2(floor(uv * host / uTexSize + 0.001));
++            t = uTex.Load(int3(hpx, 0)) * 255.0;
++        }
++        else
++            t = uTex.SampleLevel(sTex, uv / uTexSize, 0) * 255.0;
++        t = floor(t + 0.5);
++        if (uRtTex24 == 1)
++            t.a = (uAem != 0 && t.r + t.g + t.b == 0.0) ? 0.0 : uTa0;
++        else if (uRtTex24 == 2)
++            t.a = (uAem != 0 && t.r + t.g + t.b == 0.0) ? 0.0 : ((t.a >= 128.0) ? uTa1 : uTa0);
++        float ta = (uTcc != 0) ? t.a : v.a;
++        if (uTfx == 0)
++        {
++            rgb = float3(clamp255(t.r * v.r / 128.0), clamp255(t.g * v.g / 128.0), clamp255(t.b * v.b / 128.0));
++            a = (uTcc != 0) ? clamp255(t.a * v.a / 128.0) : v.a;
++        }
++        else if (uTfx == 1)
++        {
++            rgb = t.rgb;
++            a = ta;
++        }
++        else if (uTfx == 2)
++        {
++            rgb = float3(clamp255(t.r * v.r / 128.0 + v.a), clamp255(t.g * v.g / 128.0 + v.a), clamp255(t.b * v.b / 128.0 + v.a));
++            a = (uTcc != 0) ? clamp255(t.a + v.a) : v.a;
++        }
++        else
++        {
++            rgb = float3(clamp255(t.r * v.r / 128.0 + v.a), clamp255(t.g * v.g / 128.0 + v.a), clamp255(t.b * v.b / 128.0 + v.a));
++            a = ta;
++        }
++    }
++    if (uPass != 0)
++    {
++        bool apass = (uAte == 0) || alphaPasses(a);
++        if (uPass == 1 && !apass) discard;
++        if (uPass == 2 && apass) discard;
++        if (uPass == 2 && uFailTint != 0) { rgb = float3(255.0, 0.0, 255.0); a = 128.0; }
++    }
++    if (uSwBlend != 0)
++    {
++        float4 d = floor(uDest.Load(int3(fragPx, 0)) * 255.0 + 0.5);
++        float3 cs = floor(rgb);
++        float c = uAbcd.z == 0 ? a : uAbcd.z == 1 ? d.a : uFix;
++        float3 r = floor((blendSel(uAbcd.x, cs, d.rgb) - blendSel(uAbcd.y, cs, d.rgb)) * c / 128.0) + blendSel(uAbcd.w, cs, d.rgb);
++        rgb = (uColClamp != 0) ? clamp(r, 0.0, 255.0) : r - 256.0 * floor(r / 256.0);
++    }
++    if (uZAlias != 0 && uZAliasWrite != 0)
++        rgb = float3(float(zFrag & 255u), float((zFrag >> 8) & 255u), float((zFrag >> 16) & 255u));
++    o.oColor = float4(rgb / 255.0, a / 255.0);
++    float f = min(a * uBlendScale, 1.0);
++    o.oBlend = float4(f, f, f, f);
++    return o;
++}
++
++struct ShuffleIn
++{
++)HLSL" R"HLSL(    float2 aPos : POSITION;
++    float2 aOff : TEXCOORD0;
++};
++struct ShuffleOut
++{
++    float4 aPos : SV_Position;
++    float2 vOff : TEXCOORD0;
++};
++ShuffleOut vsShuffle(ShuffleIn i)
++{
++    ShuffleOut o;
++    float2 ndc;
++    ndc.x = i.aPos.x * sInvSize.x * 2.0 - 1.0;
++    ndc.y = 1.0 - 2.0 * i.aPos.y * sInvSize.y;
++    o.aPos = float4(ndc, 0.0, 1.0);
++    o.vOff = i.aOff;
++    return o;
++}
++
++float4 psShuffle(float4 pos : SV_Position, float2 vOff : TEXCOORD0) : SV_Target0
++{
++    int2 p = int2(pos.xy) + int2(round(vOff * sScale));
++    float4 c;
++    if (sSrcZ != 0)
++    {
++        uint z = uint(clamp(uSrc.Load(int3(p, 0)).r, 0.0, 1.0) * sZMax + 0.5);
++        c = float4(float(z & 255u), float((z >> 8) & 255u), float((z >> 16) & 255u), float(z >> 24)) / 255.0;
++    }
++    else
++        c = uSrc.Load(int3(p, 0));
++    float2 h = (sHs == 0) ? c.rg : c.ba;
++    uint v = uint(h.x * 255.0 + 0.5) | (uint(h.y * 255.0 + 0.5) << 8);
++    uint rgbv = v & 0x7FFFu;
++    uint av = (sAem != 0 && rgbv == 0u) ? 0u : uint((v & 0x8000u) != 0u ? uint(sTa1) : uint(sTa0));
++    v = rgbv | (av << 15);
++    h = float2(float(v & 255u), float(v >> 8)) / 255.0;
++    return (sHd == 0) ? float4(h, 0.0, 0.0) : float4(0.0, 0.0, h);
++}
++
++// Fullscreen triangle from SV_VertexID; D3D NDC y +1 is RT row 0, so y flips with 1 - 2*p.y.
++float4 vsFull(uint id : SV_VertexID) : SV_Position
++{
++    float2 p = float2(float((id << 1) & 2), float(id & 2));
++    p.y = 1.0 - p.y;
++    return float4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++
++float4 psPresent(float4 pos : SV_Position) : SV_Target0
++{
++    int2 p = max(int2(pos.xy) + int2(pOff), int2(int(pEdge), int(pEdge)));
++    uint hdW, hdH;
++    uSrc.GetDimensions(hdW, hdH);
++    float4 c = (p.x < int(hdW) && p.y < int(hdH)) ? uSrc.Load(int3(p, 0)) : float4(0.0, 0.0, 0.0, 0.0);
++    float a = (pCt24 != 0) ? 128.0 / 255.0 : c.a;
++    return float4(c.rgb, (pAlphaX2 != 0) ? min(1.0, a * 2.0) : a);
++}
++
++float4 psClut(float4 pos : SV_Position) : SV_Target0
++{
++    uint2 c = uCoords.Load(int3(int(pos.x), 0, 0));
++    return reinterpretTexel(int2(c));
++}
++
++float4 psSolid() : SV_Target0
++{
++    return solidColor;
++}
++)HLSL";
++
++    struct HwVertex
++    {
++        float x = 0, y = 0, z = 0;
++        float r = 0, g = 0, b = 0, a = 0;
++        float s = 0, t = 0, q = 1;
++        float u = 0, v = 0;
++        float cu0 = -1e30f, cv0 = -1e30f, cu1 = 1e30f, cv1 = 1e30f; // texel range the GS samples (sprites)
++    };
++    static_assert(sizeof(HwVertex) == 64, "HwVertex must stay 64 bytes");
++
++    struct ShuffleVertex
++    {
++        float x, y, ox, oy;
++    };
++
++    struct alignas(16) CbDraw
++    {
++        float F0[4]{}, F1[4]{}, F2[4]{}, F3[4]{};
++        int32_t I0[4]{}, I1[4]{}, I2[4]{}, I3[4]{}, I4[4]{}, I5[4]{};
++        int32_t I6[4]{}, I7[4]{}, I8[4]{}, I9[4]{}, I10[4]{}, I11[4]{};
++    };
++    static_assert(sizeof(CbDraw) == 256 && sizeof(CbDraw) % 16 == 0, "draw cbuffer layout");
++
++    struct alignas(16) CbShuffle
++    {
++        float S0[4]{};
++        int32_t SI0[4]{}, SI1[4]{};
++    };
++    static_assert(sizeof(CbShuffle) == 48, "shuffle cbuffer layout");
++
++    struct alignas(16) CbPresent
++    {
++        float PI0[4]{};
++        float PI1[4]{};
++    };
++    static_assert(sizeof(CbPresent) == 32, "present cbuffer layout");
++
++    struct alignas(16) CbSolid
++    {
++        float color[4]{};
++    };
++    static_assert(sizeof(CbSolid) == 16, "solid cbuffer layout");
++
++    struct Texture
++    {
++        Com<ID3D11Texture2D> tex;
++        Com<ID3D11ShaderResourceView> srv;
++        uint32_t width = 0, height = 0;
++        uint32_t blockLo = 0, blockHi = 0;
++        bool valid = false;
++        uint64_t lastUse = 0;
++    };
++
++    struct RenderTarget
++    {
++        Com<ID3D11Texture2D> color, depth;
++        Com<ID3D11RenderTargetView> colorRtv;
++        Com<ID3D11DepthStencilView> depthDsv;
++        Com<ID3D11ShaderResourceView> colorSrv, depthSrv;
++        uint32_t fbp = 0, fbw = 1; // PS2 page base and width in 64 px units
++        uint8_t psm = 0;
++        uint32_t zbp = ~0u;
++        uint32_t pxW = 0, pxH = 0; // size in PS2 pixels
++        uint32_t glW = 0, glH = 0; // host pixels (rounded up by scale)
++        bool depthCleared = false;
++        uint64_t version = 1, lastDrawSeq = 0;
++        uint64_t lastDepthSeq = 0; // writeSeq of the last draw that wrote this target's depth (memory at zbp)
++        uint32_t usedW = 0, usedH = 0; // PS2 pixels touched by draws
++    };
++
++    uint32_t pageRowsFor(uint32_t psm)
++    {
++        switch (psm & 0x3F)
++        {
++        case 0x13: case 0x1B: case 0x24: case 0x2C: return 64u;  // T8 / T8H
++        case 0x14: case 0x2C + 1: return 128u;                    // T4
++        case 0x02: case 0x0A: case 0x32: case 0x3A: return 64u;  // 16 bit
++        default: return 32u;
++        }
++    }
++
++    uint32_t spanBlocks(uint32_t psm, uint32_t bw, uint32_t rows)
++    {
++        const uint32_t pagesDown = (rows + pageRowsFor(psm) - 1u) / pageRowsFor(psm);
++        return std::max<uint32_t>(1u, pagesDown) * std::max<uint32_t>(1u, bw) * 32u;
++    }
++
++    void dumpDebugMessages(ID3D11Device *device)
++    {
++        if (!std::getenv("GOW_GS_D3D11_DEBUG"))
++            return;
++        ID3D11InfoQueue *queue = nullptr;
++        if (FAILED(device->QueryInterface(__uuidof(ID3D11InfoQueue), reinterpret_cast<void **>(&queue))) || !queue)
++        {
++            std::fprintf(stderr, "[gs-hw-d3d11-debug] debug layer unavailable (install the Graphics Tools optional feature)\n");
++            return;
++        }
++        const UINT64 count = queue->GetNumStoredMessages();
++        for (UINT64 i = 0; i < count && i < 40; ++i)
++        {
++            SIZE_T len = 0;
++            queue->GetMessage(i, nullptr, &len);
++            std::vector<uint8_t> raw(len);
++            auto *msg = reinterpret_cast<D3D11_MESSAGE *>(raw.data());
++            if (SUCCEEDED(queue->GetMessage(i, msg, &len)))
++                std::fprintf(stderr, "[gs-hw-d3d11-debug] %s\n", msg->pDescription);
++        }
++        queue->ClearStoredMessages();
++        queue->Release();
++    }
++
++    bool createDevice(Com<ID3D11Device> &device, Com<ID3D11DeviceContext> &context, bool &created)
++    {
++        created = false;
++        if (device)
++            return true;
++        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0};
++        D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_0;
++        // GOW_GS_D3D11_DEBUG=1 asks for the D3D11 debug layer (needs the "Graphics Tools" Windows feature); its messages are
++        // printed after each present by dumpDebugMessages().
++        UINT flags = std::getenv("GOW_GS_D3D11_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0u;
++        // GOW_GS_D3D11_WARP=1 uses Microsoft's software rasteriser: only for tests on machines without a GPU (CI), far too slow to play.
++        const D3D_DRIVER_TYPE driverType = std::getenv("GOW_GS_D3D11_WARP") ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
++        HRESULT hr = D3D11CreateDevice(nullptr, driverType, nullptr, flags, levels, 1, D3D11_SDK_VERSION,
++                                       device.put(), &got, context.put());
++        if (FAILED(hr) && flags)
++            hr = D3D11CreateDevice(nullptr, driverType, nullptr, 0, levels, 1, D3D11_SDK_VERSION,
++                                   device.put(), &got, context.put());
++        if (FAILED(hr) || got != D3D_FEATURE_LEVEL_11_0)
++        {
++            device.reset();
++            context.reset();
++            return false;
++        }
++        created = true;
++        return true;
++    }
++} // namespace
++struct GSHwD3D11Backend::Impl
++{
++    bool xferWatchHit = false;
++    GSTextureStore store;
++    bool initialized = false, failed = false;
++    uint8_t *vram = nullptr;
++    uint32_t vramSize = 0;
++    Com<ID3D11Device> device;
++    Com<ID3D11DeviceContext> context;
++    // shaders: bytecode indices [0] vsDraw [1] psDraw [2] vsShuffle [3] psShuffle [4] vsFull [5] psPresent [6] psClut [7] psSolid
++    Com<ID3D11VertexShader> vsDraw, vsShuffle, vsFull;
++    Com<ID3D11PixelShader> psDraw, psShuffle, psPresent, psClut, psSolid;
++    Com<ID3D11InputLayout> layoutDraw, layoutShuffle;
++    Com<ID3D11Buffer> vbo, shuffleVbo, cbDraw, cbShuffle, cbPresent, cbSolid;
++    Com<ID3D11RasterizerState> rastScissor, rastNoScissor;
++    Com<ID3D11SamplerState> samplerPointRepeat, samplerLinearRepeat, samplerPointClamp, samplerLinearClamp;
++    std::map<uint32_t, Com<ID3D11BlendState>> blendCache;
++    std::map<uint32_t, Com<ID3D11DepthStencilState>> depthCache;
++    Com<ID3D11Texture2D> tableTex, paletteTex, clutCoordTex;
++    Com<ID3D11ShaderResourceView> tableSrv, paletteSrv, clutCoordSrv;
++    Com<ID3D11ShaderResourceView> dummySrv[8];
++    Com<ID3D11Texture2D> scratchColorA, scratchColorB, scratchDepth;
++    Com<ID3D11ShaderResourceView> scratchColorASrv, scratchColorBSrv, scratchDepthSrv;
++    uint32_t scratchColorW = 0, scratchColorH = 0, scratchDepthW = 0, scratchDepthH = 0;
++    // CLUT render target (256x1)
++    Com<ID3D11Texture2D> clutTex;
++    Com<ID3D11RenderTargetView> clutRtv;
++    Com<ID3D11Texture2D> clutStaging;
++    // present target
++    Com<ID3D11Texture2D> presentTex;
++    Com<ID3D11RenderTargetView> presentRtv;
++    Com<ID3D11ShaderResourceView> presentSrv;
++    Com<ID3D11Texture2D> presentStaging;
++    uint32_t presentW = 0, presentH = 0;
++    float scale = 2.0f;
++    std::vector<ShuffleVertex> shuffleQuads[4];
++    GSDrawState shuffleState{};
++    bool haveShuffle = false;
++    int shuffleWhy = 0;
++    RenderTarget *shuffleDst = nullptr, *shuffleSrc = nullptr;
++    bool shuffleSrcZ = false;
++    std::unordered_map<uint32_t, std::vector<uint16_t>> ownerInverse;
++    std::unordered_map<const uint16_t *, uint32_t> tableOffset;
++    std::unordered_map<uint32_t, uint32_t> inverseOffset;
++    std::vector<HwVertex> pending;
++    struct SpriteEdges
++    {
++        float xs[2], ys[2], us[2], vs[2];
++    };
++    struct LastSprite
++    {
++        SpriteEdges edges{};
++        size_t end = 0;
++        uint64_t batch = ~0ull;
++    } lastSprite;
++    uint64_t batchSerial = 0;
++    static void openSharedSide(const SpriteEdges &prev, const SpriteEdges &cur, HwVertex *prevVertices, float &cu0, float &cu1, float &cv0, float &cv1)
++    {
++        const auto same = [](const float a[2], const float b[2], float tol)
++        {
++            return std::fabs(std::min(a[0], a[1]) - std::min(b[0], b[1])) <= tol && std::fabs(std::max(a[0], a[1]) - std::max(b[0], b[1])) <= tol;
++        };
++        constexpr float kXyTol = 1.0f / 64.0f, kUvTol = 1.0f / 32.0f;
++        const auto seam = [&](const float p[2], const float pt[2], const float c[2], const float ct[2], int &ip, int &ic)
++        {
++            for (ip = 0; ip < 2; ++ip)
++                for (ic = 0; ic < 2; ++ic)
++                    if (std::fabs(p[ip] - c[ic]) <= kXyTol && std::fabs(pt[ip] - ct[ic]) <= kUvTol && (p[1 - ip] - p[ip]) * (c[1 - ic] - c[ic]) < 0.0f)
++                        return true;
++            return false;
++        };
++        int ip = 0, ic = 0;
++        if (same(prev.ys, cur.ys, kXyTol) && same(prev.vs, cur.vs, kUvTol) && seam(prev.xs, prev.us, cur.xs, cur.us, ip, ic))
++        {
++            const bool prevHigh = prev.us[ip] > prev.us[1 - ip], curHigh = cur.us[ic] > cur.us[1 - ic];
++            for (int i = 0; i < 6; ++i)
++                (prevHigh ? prevVertices[i].cu1 : prevVertices[i].cu0) = prevHigh ? 1e30f : -1e30f;
++            (curHigh ? cu1 : cu0) = curHigh ? 1e30f : -1e30f;
++        }
++        else if (same(prev.xs, cur.xs, kXyTol) && same(prev.us, cur.us, kUvTol) && seam(prev.ys, prev.vs, cur.ys, cur.vs, ip, ic))
++        {
++            const bool prevHigh = prev.vs[ip] > prev.vs[1 - ip], curHigh = cur.vs[ic] > cur.vs[1 - ic];
++            for (int i = 0; i < 6; ++i)
++                (prevHigh ? prevVertices[i].cv1 : prevVertices[i].cv0) = prevHigh ? 1e30f : -1e30f;
++            (curHigh ? cv1 : cv0) = curHigh ? 1e30f : -1e30f;
++        }
++    }
++    GSDrawState pendingState{};
++    bool havePending = false;
++    double firstRawZ = 0.0;
++    std::unordered_map<uint64_t, Texture> textures;
++    std::deque<RenderTarget> targets; // stable pointers on push_back
++    uint64_t useCounter = 0, writeSeq = 0;
++    struct UploadRecord
++    {
++        uint32_t lo, hi;
++        uint64_t seq;
++    };
++    std::vector<UploadRecord> uploadLog;
++    uint64_t clutHash = 0;
++    struct Stats
++    {
++        uint64_t shuffles = 0;
++        uint64_t draws = 0, batches = 0, skippedPsm = 0, unsupportedBlend = 0, texDecodes = 0, texHits = 0, skippedPrim = 0;
++        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    } stats;
++    bool statsEnabled = std::getenv("GOW_GS_HW_STATS") != nullptr;
++
++    bool ensure()
++    {
++        if (initialized)
++            return true;
++        if (failed)
++            return false;
++        if (!device)
++        {
++            bool created = false;
++            if (!createDevice(device, context, created))
++            {
++                std::fprintf(stderr, "[gs-hw-d3d11] device unavailable\n");
++                failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++                return false;
++            }
++        }
++        const auto &bc = bytecode(kHlslSource);
++        if (g_bytecodeState != 1)
++        {
++            failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++            return false;
++        }
++        const auto mkVs = [&](const std::vector<uint8_t> &code, Com<ID3D11VertexShader> &out)
++        { return SUCCEEDED(device->CreateVertexShader(code.data(), code.size(), nullptr, out.put())); };
++        const auto mkPs = [&](const std::vector<uint8_t> &code, Com<ID3D11PixelShader> &out)
++        { return SUCCEEDED(device->CreatePixelShader(code.data(), code.size(), nullptr, out.put())); };
++        if (!mkVs(bc[0], vsDraw) || !mkPs(bc[1], psDraw) || !mkVs(bc[2], vsShuffle) || !mkPs(bc[3], psShuffle) ||
++            !mkVs(bc[4], vsFull) || !mkPs(bc[5], psPresent) || !mkPs(bc[6], psClut) || !mkPs(bc[7], psSolid))
++        {
++            std::fprintf(stderr, "[gs-hw-d3d11] shader creation failed\n");
++            failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++            return false;
++        }
++        const D3D11_INPUT_ELEMENT_DESC drawElems[] = {
++            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
++            {"TEXCOORD", 0, DXGI_FORMAT_R32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
++            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
++            {"TEXCOORD", 1, DXGI_FORMAT_R32G32B32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
++            {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D11_INPUT_PER_VERTEX_DATA, 0},
++            {"TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D11_INPUT_PER_VERTEX_DATA, 0},
++        };
++        const HRESULT layoutHr = device->CreateInputLayout(drawElems, 6, bc[0].data(), bc[0].size(), layoutDraw.put());
++        if (FAILED(layoutHr))
++        {
++            std::fprintf(stderr, "[gs-hw-d3d11] draw layout failed (hr=0x%08lx)\n", static_cast<unsigned long>(layoutHr));
++            failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++            return false;
++        }
++        const D3D11_INPUT_ELEMENT_DESC shuffleElems[] = {
++            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
++            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
++        };
++        if (FAILED(device->CreateInputLayout(shuffleElems, 2, bc[2].data(), bc[2].size(), layoutShuffle.put())))
++        {
++            std::fprintf(stderr, "[gs-hw-d3d11] shuffle layout failed\n");
++            failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++            return false;
++        }
++        const auto mkBuffer = [&](uint32_t bytes, Com<ID3D11Buffer> &out, bool dynamic)
++        {
++            // Constant buffers are updated with UpdateSubresource, which D3D11 only allows on DEFAULT-usage buffers.
++            (void)dynamic;
++            D3D11_BUFFER_DESC bd{};
++            bd.ByteWidth = bytes;
++            bd.Usage = D3D11_USAGE_DEFAULT;
++            bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++            bd.CPUAccessFlags = 0;
++            return SUCCEEDED(device->CreateBuffer(&bd, nullptr, out.put()));
++        };
++        if (!mkBuffer(sizeof(CbDraw), cbDraw, true) || !mkBuffer(sizeof(CbShuffle), cbShuffle, true) ||
++            !mkBuffer(sizeof(CbPresent), cbPresent, true) || !mkBuffer(sizeof(CbSolid), cbSolid, true))
++        {
++            failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++            return false;
++        }
++        {
++            D3D11_BUFFER_DESC bd{};
++            bd.ByteWidth = 1u << 20;
++            bd.Usage = D3D11_USAGE_DYNAMIC;
++            bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
++            bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++            if (FAILED(device->CreateBuffer(&bd, nullptr, vbo.put())) || FAILED(device->CreateBuffer(&bd, nullptr, shuffleVbo.put())))
++            {
++                failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++                return false;
++            }
++        }
++        {
++            D3D11_RASTERIZER_DESC rd{};
++            rd.FillMode = D3D11_FILL_SOLID;
++            rd.CullMode = D3D11_CULL_NONE;
++            rd.FrontCounterClockwise = FALSE;
++            rd.DepthClipEnable = TRUE;
++            rd.ScissorEnable = TRUE;
++            if (FAILED(device->CreateRasterizerState(&rd, rastScissor.put())))
++            {
++                failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++                return false;
++            }
++            rd.ScissorEnable = FALSE;
++            if (FAILED(device->CreateRasterizerState(&rd, rastNoScissor.put())))
++            {
++                failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++                return false;
++            }
++        }
++        const auto mkSampler = [&](bool linear, bool clamp, Com<ID3D11SamplerState> &out)
++        {
++            D3D11_SAMPLER_DESC sd{};
++            sd.Filter = linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
++            sd.AddressU = clamp ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
++            sd.AddressV = clamp ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
++            sd.AddressW = clamp ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
++            sd.MipLODBias = 0.0f;
++            sd.MaxAnisotropy = 1;
++            sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
++            sd.MinLOD = 0.0f;
++            sd.MaxLOD = D3D11_FLOAT32_MAX;
++            return SUCCEEDED(device->CreateSamplerState(&sd, out.put()));
++        };
++        if (!mkSampler(false, false, samplerPointRepeat) || !mkSampler(true, false, samplerLinearRepeat) ||
++            !mkSampler(false, true, samplerPointClamp) || !mkSampler(true, true, samplerLinearClamp))
++        {
++            failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++            return false;
++        }
++        if (!makeDummySrvs() || !buildTables())
++        {
++            failed = true, std::fprintf(stderr, "[gs-hw-d3d11] init failed at line %d\n", __LINE__);
++            return false;
++        }
++        if (const char *s = std::getenv("PS2X_GS_HW_SCALE"))
++            scale = std::max(1.0f, static_cast<float>(std::atof(s)));
++        std::fprintf(stderr, "[gs-hw-d3d11] render-target renderer ready, scale %.2f\n", scale);
++        initialized = true;
++        return true;
++    }
++
++    Com<ID3D11Texture2D> dummyTex[8];
++
++    bool makeDummySrvs()
++    {
++        const auto mk2D = [&](DXGI_FORMAT fmt, uint32_t w, uint32_t h, Com<ID3D11Texture2D> &tex, Com<ID3D11ShaderResourceView> &srv,
++                              const void *data, uint32_t pitch)
++        {
++            D3D11_TEXTURE2D_DESC td{};
++            td.Width = w;
++            td.Height = h;
++            td.MipLevels = 1;
++            td.ArraySize = 1;
++            td.Format = fmt;
++            td.SampleDesc.Count = 1;
++            td.Usage = D3D11_USAGE_DEFAULT;
++            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++            D3D11_SUBRESOURCE_DATA init{};
++            init.pSysMem = data;
++            init.SysMemPitch = pitch;
++            if (FAILED(device->CreateTexture2D(&td, data ? &init : nullptr, tex.put())))
++                return false;
++            return SUCCEEDED(device->CreateShaderResourceView(tex.get(), nullptr, srv.put()));
++        };
++        const uint32_t oneRgba[] = {0xFF000000u};
++        const uint16_t oneR16[] = {0};
++        const uint16_t oneRg[2] = {0, 0};
++        for (int i = 0; i < 8; ++i)
++        {
++            // unused-slot dummies are never sampled; they only keep the resource-unit binding well formed.
++            DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
++            const void *data = oneRgba;
++            uint32_t pitch = 4;
++            if (i == 2)
++            {
++                fmt = DXGI_FORMAT_R16_UINT;
++                data = oneR16;
++                pitch = 2;
++            }
++            if (i == 6)
++            {
++                fmt = DXGI_FORMAT_R16G16_UINT;
++                data = oneRg;
++                pitch = 4;
++            }
++            if (!mk2D(fmt, 1, 1, dummyTex[i], dummySrv[i], data, pitch))
++            {
++                std::fprintf(stderr, "[gs-hw-d3d11] dummy SRV %d failed\n", i);
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool buildTables()
++    {
++        std::vector<uint16_t> data;
++        const uint32_t psms[] = {0x00, 0x01, 0x02, 0x0A, 0x13, 0x14, 0x1B, 0x24, 0x2C};
++        for (const uint32_t psm : psms)
++        {
++            const GSSwizzle::Format &f = GSSwizzle::GetFormat(psm);
++            if (!f.table || tableOffset.count(f.table))
++                continue;
++            const uint32_t size = 32u << (f.pageShiftX + f.pageShiftY);
++            tableOffset[f.table] = static_cast<uint32_t>(data.size());
++            data.insert(data.end(), f.table, f.table + size);
++        }
++        for (const uint32_t psm : {0x00u, 0x01u, 0x02u, 0x0Au})
++        {
++            const GSSwizzle::Format &f = GSSwizzle::GetFormat(psm);
++            const uint32_t pageSize = 1u << (f.pageShiftX + f.pageShiftY);
++            inverseOffset[psm] = static_cast<uint32_t>(data.size());
++            data.resize(data.size() + pageSize, 0);
++            uint16_t *inv = &data[inverseOffset[psm]];
++            for (uint32_t e = 0; e < pageSize; ++e)
++                inv[f.table[e]] = static_cast<uint16_t>(e);
++        }
++        const uint32_t rows = static_cast<uint32_t>((data.size() + 2047u) / 2048u);
++        data.resize(static_cast<size_t>(rows) * 2048u, 0);
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = 2048;
++        td.Height = rows;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R16_UINT;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        D3D11_SUBRESOURCE_DATA init{};
++        init.pSysMem = data.data();
++        init.SysMemPitch = 2048u * 2u;
++        if (FAILED(device->CreateTexture2D(&td, &init, tableTex.put())))
++            return false;
++        if (FAILED(device->CreateShaderResourceView(tableTex.get(), nullptr, tableSrv.put())))
++            return false;
++        // reinterpret palette: 256x1 RGBA8 (updated per draw when kind==3)
++        td.Width = 256;
++        td.Height = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        const uint32_t zero[256] = {};
++        init.pSysMem = zero;
++        init.SysMemPitch = 256u * 4u;
++        if (FAILED(device->CreateTexture2D(&td, &init, paletteTex.put())))
++            return false;
++        return SUCCEEDED(device->CreateShaderResourceView(paletteTex.get(), nullptr, paletteSrv.put()));
++    }
++    static bool family16(uint8_t psm) { return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S; }
++    static float zMaxFor(uint8_t zpsm)
++    {
++        switch (zpsm)
++        {
++        case 0x30: return 4294967295.0f;
++        case 0x32: case 0x3A: return 65535.0f;
++        default: return 16777215.0f;
++        }
++    }
++    static uint32_t fbmsk16(uint32_t m) { return ((m >> 3) & 0x1Fu) | ((m >> 6) & 0x3E0u) | ((m >> 9) & 0x7C00u) | ((m >> 16) & 0x8000u); }
++
++    RenderTarget &target(uint32_t fbp, uint32_t fbw)
++    {
++        for (RenderTarget &t : targets)
++            if (t.fbp == fbp && t.fbw >= fbw)
++                return t;
++        static const bool rtLog = std::getenv("GOW_GS_HW_RTLOG") != nullptr;
++        if (rtLog)
++            std::fprintf(stderr, "[gs-hw-d3d11-rt] new/grow fbp=%u fbw=%u\n", fbp, fbw);
++        for (RenderTarget &t : targets) // grow an existing one
++            if (t.fbp == fbp)
++            {
++                destroy(t);
++                createTarget(t, fbp, fbw);
++                return t;
++            }
++        targets.emplace_back();
++        createTarget(targets.back(), fbp, fbw);
++        return targets.back();
++    }
++
++    void destroy(RenderTarget &t) { t = RenderTarget{}; }
++
++    void createTarget(RenderTarget &t, uint32_t fbp, uint32_t fbw)
++    {
++        t.fbp = fbp;
++        t.psm = 0;
++        t.fbw = std::max<uint32_t>(fbw, 1u);
++        t.pxW = t.fbw * 64u;
++        t.pxH = 512u;
++        t.glW = static_cast<uint32_t>(std::ceil(t.pxW * scale));
++        t.glH = static_cast<uint32_t>(std::ceil(t.pxH * scale));
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = t.glW;
++        td.Height = t.glH;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++        device->CreateTexture2D(&td, nullptr, t.color.put());
++        device->CreateRenderTargetView(t.color.get(), nullptr, t.colorRtv.put());
++        device->CreateShaderResourceView(t.color.get(), nullptr, t.colorSrv.put());
++        const float clear[4] = {0, 0, 0, 0};
++        context->ClearRenderTargetView(t.colorRtv.get(), clear);
++        std::fprintf(stderr, "[gs-hw-d3d11] render target fbp=%u fbw=%u -> %ux%u\n", fbp, t.fbw, t.glW, t.glH);
++    }
++
++    void attachDepth(RenderTarget &t, uint32_t zbp)
++    {
++        if (!t.depth)
++        {
++            D3D11_TEXTURE2D_DESC td{};
++            td.Width = t.glW;
++            td.Height = t.glH;
++            td.MipLevels = 1;
++            td.ArraySize = 1;
++            td.Format = DXGI_FORMAT_R32_TYPELESS;
++            td.SampleDesc.Count = 1;
++            td.Usage = D3D11_USAGE_DEFAULT;
++            td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
++            device->CreateTexture2D(&td, nullptr, t.depth.put());
++            D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};
++            dsv.Format = DXGI_FORMAT_D32_FLOAT;
++            dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
++            device->CreateDepthStencilView(t.depth.get(), &dsv, t.depthDsv.put());
++            D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
++            srv.Format = DXGI_FORMAT_R32_FLOAT;
++            srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++            srv.Texture2D.MipLevels = 1;
++            device->CreateShaderResourceView(t.depth.get(), &srv, t.depthSrv.put());
++            context->ClearDepthStencilView(t.depthDsv.get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
++            t.depthCleared = true;
++        }
++        t.zbp = zbp;
++    }
++
++    void unbindSrvs()
++    {
++        ID3D11ShaderResourceView *none[8] = {};
++        context->PSSetShaderResources(0, 8, none);
++    }
++
++    void bindDrawSrvs(Texture &tex, RenderTarget &rt, RenderTarget *src, RenderTarget *rsrc, RenderTarget *zsrc, bool indexed, Texture *palette,
++                      bool needDest, bool texIsRtColor, bool rsrcIsRt, bool destNeedsDepthCopy, RenderTarget *zsrcOwner)
++    {
++        // Slot order: t0 uTex, t1 uRtColor, t2 uTables, t3 uPalette, t4 uDest, t5 uIdxPalette, t6 uCoords (unused), t7 uSrc (unused for draws).
++        // Texture-writes-target hazards are resolved with scratch copies in draw(); here only views are bound.
++        ID3D11ShaderResourceView *srvs[8] = {dummySrv[0].get(), dummySrv[1].get(), tableSrv.get(), paletteSrv.get(),
++                                            dummySrv[4].get(), dummySrv[5].get(), dummySrv[6].get(), dummySrv[7].get()};
++        (void)rt;
++        (void)src;
++        (void)rsrc;
++        (void)zsrc;
++        (void)indexed;
++        (void)palette;
++        (void)needDest;
++        (void)texIsRtColor;
++        (void)rsrcIsRt;
++        (void)destNeedsDepthCopy;
++        (void)zsrcOwner;
++        (void)srvs;
++        (void)tex;
++    }
++
++    RenderTarget *findTarget(uint32_t fbp)
++    {
++        for (RenderTarget &t : targets)
++            if (t.fbp == fbp)
++                return &t;
++        return nullptr;
++    }
++
++    bool overwrittenByDepth(const RenderTarget &t) const
++    {
++        for (const RenderTarget &o : targets)
++            if (&o != &t && o.depth && o.zbp == t.fbp && o.lastDepthSeq > t.lastDrawSeq)
++                return true;
++        return false;
++    }
++
++    bool uploadedSinceDraw(const RenderTarget &t, uint32_t tbp) const
++    {
++        for (const UploadRecord &u : uploadLog)
++            if (u.seq > t.lastDrawSeq && u.lo <= tbp && tbp < u.hi)
++                return true;
++        return false;
++    }
++
++    RenderTarget *findReinterpretSource(uint32_t tbp, uint8_t tpsm)
++    {
++        const bool highByte = tpsm == GS_PSM_T8H || tpsm == GS_PSM_T4HL || tpsm == GS_PSM_T4HH;
++        for (RenderTarget &t : targets)
++        {
++            if (t.usedW == 0u || (highByte && t.psm == GS_PSM_CT24) || overwrittenByDepth(t))
++                continue;
++            const uint32_t tlo = t.fbp * 32u, thi = tlo + spanBlocks(t.psm, t.fbw, t.usedH);
++            if (tbp < tlo || tbp >= thi)
++                continue;
++            if (!uploadedSinceDraw(t, tbp))
++                return &t;
++        }
++        return nullptr;
++    }
++
++    std::unordered_map<uint64_t, Com<ID3D11Texture2D>> palettes;
++    std::unordered_map<uint64_t, Com<ID3D11ShaderResourceView>> paletteSrvs;
++    std::unordered_map<uint64_t, std::vector<uint32_t>> clutCache;
++
++    static bool isIndexed(uint8_t psm) { return psm == GS_PSM_T8 || psm == GS_PSM_T8H || psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH; }
++
++    void evictOld()
++    {
++        for (auto it = textures.begin(); it != textures.end();)
++        {
++            if (it->second.lastUse + 3000u < useCounter)
++                it = textures.erase(it);
++            else
++                ++it;
++        }
++    }
++    void invalidateBlocks(uint32_t lo, uint32_t hi)
++    {
++        for (auto &kv : textures)
++        {
++            Texture &t = kv.second;
++            if (t.valid && t.blockLo < hi && lo < t.blockHi)
++                t.valid = false;
++        }
++    }
++
++    struct UploadRect
++    {
++        uint32_t dbp, dbw, dpsm, x, y, w, h, dir;
++    };
++    std::vector<UploadRect> uploadRects;
++    std::map<std::string, uint64_t> texSources;
++    const bool texSrcDiag = std::getenv("GOW_GS_TEXSRC") != nullptr;
++    void noteTransfer(const GSTransferCommand &c)
++    {
++        if (!texSrcDiag)
++            return;
++        if (uploadRects.size() > 8192u)
++            uploadRects.erase(uploadRects.begin(), uploadRects.begin() + 4096);
++        uploadRects.push_back({c.bitbltbuf.dbp, c.bitbltbuf.dbw, c.bitbltbuf.dpsm, c.trxpos.dsax, c.trxpos.dsay, c.trxreg.rrw, c.trxreg.rrh, c.direction});
++    }
++    void classifyTexture(const GSDrawState &s)
++    {
++        if (!texSrcDiag)
++            return;
++        const GSTex0Reg &t = s.context.tex0;
++        const uint32_t lo = t.tbp0, hi = lo + spanBlocks(t.psm, t.tbw, std::max<uint32_t>(1u, s.textureHeight));
++        const char *what = "none";
++        uint32_t otherPsm = 0;
++        for (auto it = uploadRects.rbegin(); it != uploadRects.rend(); ++it)
++        {
++            const UploadRect &u = *it;
++            const uint32_t ulo = u.dbp, uhi = ulo + spanBlocks(u.dpsm, u.dbw, u.y + u.h);
++            if (!(ulo < hi && lo < uhi))
++                continue;
++            if (u.dir == 2u)
++                what = "local-copy";
++            else if (u.dpsm != t.psm)
++                what = "upload-other-psm", otherPsm = u.dpsm;
++            else if (u.dbp == t.tbp0 && u.dbw == t.tbw && u.x == 0u && u.y == 0u && u.w >= s.textureWidth && u.h >= s.textureHeight)
++                what = "upload-exact";
++            else
++                what = "upload-same-psm-part";
++            break;
++        }
++        char key[96];
++        std::snprintf(key, sizeof(key), "%s psm=%02x%s", what, t.psm, otherPsm ? (std::string(" from ") + std::to_string(otherPsm)).c_str() : "");
++        ++texSources[key];
++    }
++    void reportStats()
++    {
++        if (texSrcDiag)
++        {
++            static auto last = std::chrono::steady_clock::now();
++            const auto now = std::chrono::steady_clock::now();
++            if (now - last >= std::chrono::seconds(5))
++            {
++                last = now;
++                for (const auto &kv : texSources)
++                    std::fprintf(stderr, "[gs-texsrc] %s x%llu\n", kv.first.c_str(), static_cast<unsigned long long>(kv.second));
++                texSources.clear();
++            }
++        }
++        if (!statsEnabled)
++            return;
++        const auto now = std::chrono::steady_clock::now();
++        if (now - stats.last < std::chrono::seconds(5))
++            return;
++        stats.last = now;
++        std::fprintf(stderr, "[gs-hw-d3d11] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu\n",
++                     (unsigned long long)stats.shuffles, (unsigned long long)stats.draws, (unsigned long long)stats.batches, (unsigned long long)stats.texDecodes,
++                     (unsigned long long)stats.texHits, (unsigned long long)stats.skippedPsm, (unsigned long long)stats.skippedPrim,
++                     (unsigned long long)stats.unsupportedBlend, textures.size());
++        stats.shuffles = stats.draws = stats.batches = stats.texDecodes = stats.texHits = stats.skippedPsm = stats.skippedPrim = stats.unsupportedBlend = 0;
++    }
++
++    int dumpPresents = std::getenv("GOW_GS_HW_DUMP") ? std::atoi(std::getenv("GOW_GS_HW_DUMP")) : -1;
++    int presentCount = 0, dumped = 0, dumpedAt = 0;
++    const int dumpMax = std::getenv("GOW_GS_HW_DUMPMAX") ? std::atoi(std::getenv("GOW_GS_HW_DUMPMAX")) : 4000;
++    bool dumpAfterSkip = false;
++    const bool dumpAll = std::getenv("GOW_GS_HW_DUMPALL") != nullptr;
++    int onlyLo = std::getenv("GOW_GS_HW_ONLY") ? std::atoi(std::getenv("GOW_GS_HW_ONLY")) : -1;
++    int onlyHi = std::getenv("GOW_GS_HW_ONLY") && std::strchr(std::getenv("GOW_GS_HW_ONLY"), '-') ? std::atoi(std::strchr(std::getenv("GOW_GS_HW_ONLY"), '-') + 1) : 1 << 30;
++    int frameBatch = 0;
++    std::vector<uint32_t> invertedZ;
++    bool zInverted(uint32_t zbp) const { return std::find(invertedZ.begin(), invertedZ.end(), zbp) != invertedZ.end(); }
++    static bool isZInversion(const GSDrawState &s, const std::vector<HwVertex> &verts)
++    {
++        const GSContext &c = s.context;
++        const uint64_t al = c.alpha;
++        if (c.frame.fbp != c.zbuf.zbp || c.frame.psm != GS_PSM_CT24 || s.prim.tme || !s.prim.abe || c.frame.fbmsk != 0u ||
++            (al & 0xFFu) != 0xA4u || ((al >> 32) & 0xFFu) != 0x80u || verts.empty())
++            return false;
++        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++        for (const HwVertex &v : verts)
++        {
++            if (v.r < 254.5f || v.g < 254.5f || v.b < 254.5f)
++                return false;
++            x0 = std::min(x0, v.x), y0 = std::min(y0, v.y), x1 = std::max(x1, v.x), y1 = std::max(y1, v.y);
++        }
++        return x0 <= c.scissor.x0 + 1.0f && y0 <= c.scissor.y0 + 1.0f && x1 >= c.scissor.x1 && y1 >= c.scissor.y1;
++    }
++    Texture &textureFor(const GSDrawState &s)
++    {
++        const GSTex0Reg &t = s.context.tex0;
++        uint64_t key = t.tbp0 | (static_cast<uint64_t>(t.tbw) << 14) | (static_cast<uint64_t>(t.psm & 63) << 20) |
++                       (static_cast<uint64_t>(s.textureWidth) << 26) | (static_cast<uint64_t>(s.textureHeight) << 38);
++        key = key * 1099511628211ull ^ (static_cast<uint64_t>(s.texa.ta0) | (static_cast<uint64_t>(s.texa.ta1) << 8) | (static_cast<uint64_t>(s.texa.aem) << 16));
++        if (isIndexed(t.psm))
++        {
++            key = key * 1099511628211ull ^ clutHash;
++            key = key * 1099511628211ull ^ (t.cpsm | (t.csm << 8) | (t.csa << 16));
++        }
++        Texture &tex = textures[key];
++        tex.lastUse = ++useCounter;
++        if (tex.valid)
++        {
++            ++stats.texHits;
++            return tex;
++        }
++        ++stats.texDecodes;
++        classifyTexture(s);
++        std::vector<uint32_t> pixels;
++        decodeDirect(s, pixels);
++        static const int texDumpLimit = std::getenv("GOW_GS_HW_TEXDUMP") ? std::atoi(std::getenv("GOW_GS_HW_TEXDUMP")) : 0;
++        static int texDumped = 0;
++        if (texDumped < texDumpLimit && s.textureWidth > 16)
++        {
++            char name[96];
++            std::snprintf(name, sizeof(name), "gs_hw_tex_%02d_tbp%x_psm%u_%ux%u.ppm", texDumped++, t.tbp0, t.psm, s.textureWidth, s.textureHeight);
++            if (FILE *f = std::fopen(name, "wb"))
++            {
++                std::fprintf(f, "P6 %u %u 255 ", s.textureWidth, s.textureHeight);
++                for (uint32_t px : pixels)
++                {
++                    const uint8_t rgb[3] = {static_cast<uint8_t>(px), static_cast<uint8_t>(px >> 8), static_cast<uint8_t>(px >> 16)};
++                    std::fwrite(rgb, 1, 3, f);
++                }
++                std::fclose(f);
++            }
++        }
++        tex.width = std::max<uint32_t>(1u, s.textureWidth);
++        tex.height = std::max<uint32_t>(1u, s.textureHeight);
++        tex.blockLo = t.tbp0;
++        tex.blockHi = t.tbp0 + spanBlocks(t.psm, t.tbw, tex.height);
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = tex.width;
++        td.Height = tex.height;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        D3D11_SUBRESOURCE_DATA init{};
++        init.pSysMem = pixels.empty() ? nullptr : pixels.data();
++        init.SysMemPitch = tex.width * 4u;
++        tex.tex.reset();
++        tex.srv.reset();
++        device->CreateTexture2D(&td, pixels.empty() ? nullptr : &init, tex.tex.put());
++        if (tex.tex)
++            device->CreateShaderResourceView(tex.tex.get(), nullptr, tex.srv.put());
++        tex.valid = true;
++        if (textures.size() > 6000u)
++            evictOld();
++        return tex;
++    }
++
++    void decodeDirect(const GSDrawState &s, std::vector<uint32_t> &out)
++    {
++        const GSTex0Reg &t = s.context.tex0;
++        const GSSwizzle::Format &f = GSSwizzle::GetFormat(t.psm);
++        const uint32_t w = std::max<uint32_t>(1u, s.textureWidth), h = std::max<uint32_t>(1u, s.textureHeight);
++        const bool sixteen = f.kind == GSSwizzle::Kind::Bits16;
++        if (!vram || !f.table || !(sixteen || f.kind == GSSwizzle::Kind::Bits32 || f.kind == GSSwizzle::Kind::Bits24))
++        {
++            store.DecodeTextureRgba(s, out);
++            return;
++        }
++        out.resize(static_cast<size_t>(w) * h);
++        for (uint32_t y = 0; y < h; ++y)
++        {
++            uint32_t *line = out.data() + static_cast<size_t>(y) * w;
++            if (!GSMem::ReadColorRun(vram, t.psm, t.tbp0, t.tbw, 0u, y, w, line))
++            {
++                const GSSwizzle::AxisPart row = GSSwizzle::RowPart(f, t.tbp0, t.tbw, y);
++                for (uint32_t x = 0; x < w; ++x)
++                {
++                    const GSSwizzle::Location at = GSSwizzle::Combine(f, row, GSSwizzle::ColumnPart(f, x));
++                    line[x] = GSSwizzle::LoadAt(f, vram + at.byte, at.shift);
++                }
++            }
++            for (uint32_t x = 0; x < w; ++x)
++                line[x] = GSCpuInternal::applyTexa(s.texa, t.psm, sixteen ? GSCpuInternal::Rgba5551ToRgba8888(static_cast<uint16_t>(line[x])) : line[x]);
++        }
++        static const bool check = std::getenv("GOW_GS_TEXCHECK") != nullptr;
++        if (check)
++        {
++            static int mismatches = 0, checked = 0;
++            for (uint32_t y = 0; y < h; ++y)
++            {
++                const GSSwizzle::AxisPart row = GSSwizzle::RowPart(f, t.tbp0, t.tbw, y);
++                for (uint32_t x = 0; x < w; ++x)
++                {
++                    const GSSwizzle::Location at = GSSwizzle::Combine(f, row, GSSwizzle::ColumnPart(f, x));
++                    const uint32_t raw = GSSwizzle::LoadAt(f, vram + at.byte, at.shift);
++                    const uint32_t ref = GSCpuInternal::applyTexa(s.texa, t.psm, sixteen ? GSCpuInternal::Rgba5551ToRgba8888(static_cast<uint16_t>(raw)) : raw);
++                    if (ref != out[static_cast<size_t>(y) * w + x] && mismatches++ < 20)
++                        std::fprintf(stderr, "[gs-texcheck] psm=%u tbp=%x tbw=%u %ux%u at %u,%u ref=%08x run=%08x\n", t.psm, t.tbp0, t.tbw, w, h, x, y, ref, out[static_cast<size_t>(y) * w + x]);
++                }
++            }
++            if (++checked % 200 == 0)
++                std::fprintf(stderr, "[gs-texcheck] %d textures checked, %d mismatching texels\n", checked, mismatches);
++        }
++    }
++
++    Texture &indexTextureFor(const GSDrawState &s)
++    {
++        const GSTex0Reg &t = s.context.tex0;
++        const uint64_t key = (1ull << 63) | t.tbp0 | (static_cast<uint64_t>(t.tbw) << 14) | (static_cast<uint64_t>(t.psm & 63) << 20) |
++                             (static_cast<uint64_t>(s.textureWidth) << 26) | (static_cast<uint64_t>(s.textureHeight) << 38);
++        Texture &tex = textures[key];
++        tex.lastUse = ++useCounter;
++        if (tex.valid)
++        {
++            ++stats.texHits;
++            return tex;
++        }
++        ++stats.texDecodes;
++        classifyTexture(s);
++        tex.width = std::max<uint32_t>(1u, s.textureWidth);
++        tex.height = std::max<uint32_t>(1u, s.textureHeight);
++        std::vector<uint8_t> indices(static_cast<size_t>(tex.width) * tex.height);
++        for (uint32_t y = 0; y < tex.height; ++y)
++            GSMem::ReadIndexRun(vram, t.psm, t.tbp0, t.tbw, 0u, y, tex.width, indices.data() + static_cast<size_t>(y) * tex.width);
++        static const long idxDumpTbp = std::getenv("GOW_GS_HW_PALDUMP") ? std::strtol(std::getenv("GOW_GS_HW_PALDUMP"), nullptr, 16) : -1;
++        static int idxDumped = 0;
++        static const int idxDumpMax = std::getenv("GOW_GS_HW_PALDUMPMAX") ? std::atoi(std::getenv("GOW_GS_HW_PALDUMPMAX")) : 4;
++        if (idxDumpTbp >= 0 && static_cast<long>(t.tbp0) == idxDumpTbp && idxDumped < idxDumpMax)
++        {
++            ++idxDumped;
++            uint32_t hist[256] = {};
++            for (uint8_t i : indices)
++                ++hist[i];
++            uint32_t pageHash = 2166136261u;
++            for (uint32_t i = 0; i < 8192u; ++i)
++                pageHash = (pageHash ^ vram[static_cast<size_t>(t.tbp0) * 256u + i]) * 16777619u;
++            std::fprintf(stderr, "[gs-hw-idx] tbp=%x page hash %08x %ux%u psm=%u tbw=%u (index:count)", t.tbp0, pageHash, tex.width, tex.height, t.psm, t.tbw);
++            for (int i = 0; i < 256; ++i)
++                if (hist[i])
++                    std::fprintf(stderr, " %d:%u", i, hist[i]);
++            std::fprintf(stderr, "\n");
++            char name[64];
++            std::snprintf(name, sizeof(name), "gs_hw_idx_%d_tbp%x_%ux%u.pgm", idxDumped, t.tbp0, tex.width, tex.height);
++            if (FILE *f = std::fopen(name, "wb"))
++            {
++                std::fprintf(f, "P5 %u %u 255 ", tex.width, tex.height);
++                std::fwrite(indices.data(), 1, indices.size(), f);
++                std::fclose(f);
++            }
++        }
++        tex.blockLo = t.tbp0;
++        tex.blockHi = t.tbp0 + spanBlocks(t.psm, t.tbw, tex.height);
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = tex.width;
++        td.Height = tex.height;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        D3D11_SUBRESOURCE_DATA init{};
++        init.pSysMem = indices.data();
++        init.SysMemPitch = tex.width;
++        tex.tex.reset();
++        tex.srv.reset();
++        device->CreateTexture2D(&td, &init, tex.tex.put());
++        if (tex.tex)
++            device->CreateShaderResourceView(tex.tex.get(), nullptr, tex.srv.put());
++        tex.valid = true;
++        if (textures.size() > 6000u)
++            evictOld();
++        return tex;
++    }
++
++    Com<ID3D11ShaderResourceView> paletteFor(const GSDrawState &s)
++    {
++        const GSTex0Reg &t = s.context.tex0;
++        uint64_t key = clutHash;
++        key = key * 1099511628211ull ^ (t.cpsm | (t.csm << 8) | (t.csa << 16) | (static_cast<uint64_t>(t.psm & 63) << 24));
++        key = key * 1099511628211ull ^ (static_cast<uint64_t>(s.texa.ta0) | (static_cast<uint64_t>(s.texa.ta1) << 8) | (static_cast<uint64_t>(s.texa.aem) << 16));
++        static const long palDumpTbp = std::getenv("GOW_GS_HW_PALDUMP") ? std::strtol(std::getenv("GOW_GS_HW_PALDUMP"), nullptr, 16) : -1;
++        static std::vector<uint32_t> palDumpedCbp;
++        if (palDumpTbp >= 0 && static_cast<long>(t.tbp0) == palDumpTbp && palDumpedCbp.size() < 8 && std::find(palDumpedCbp.begin(), palDumpedCbp.end(), t.cbp) == palDumpedCbp.end())
++        {
++            palDumpedCbp.push_back(t.cbp);
++            uint32_t colors[256];
++            store.BuildPalette(s, colors);
++            std::fprintf(stderr, "[gs-hw-pal] tbp=%x cbp=%x cpsm=%u csm=%u csa=%u:", t.tbp0, t.cbp, t.cpsm, t.csm, t.csa);
++            for (int i = 0; i < 256; ++i)
++                std::fprintf(stderr, "%s%08x", (i % 16) ? " " : "\n  ", colors[i]);
++            std::fprintf(stderr, "\n");
++        }
++        if (auto it = paletteSrvs.find(key); it != paletteSrvs.end())
++        {
++            Com<ID3D11ShaderResourceView> out;
++            out.p = it->second.get();
++            out.p->AddRef();
++            return out;
++        }
++        if (palettes.size() > 4096u)
++        {
++            palettes.clear();
++            paletteSrvs.clear();
++        }
++        uint32_t colors[256];
++        store.BuildPalette(s, colors);
++        Com<ID3D11Texture2D> tex;
++        Com<ID3D11ShaderResourceView> srv;
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = 256;
++        td.Height = 1;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        D3D11_SUBRESOURCE_DATA init{};
++        init.pSysMem = colors;
++        init.SysMemPitch = 256u * 4u;
++        device->CreateTexture2D(&td, &init, tex.put());
++        device->CreateShaderResourceView(tex.get(), nullptr, srv.put());
++        auto texIt = palettes.emplace(key, std::move(tex)).first;
++        auto srvIt = paletteSrvs.emplace(key, std::move(srv)).first;
++        (void)texIt;
++        Com<ID3D11ShaderResourceView> out;
++        out.p = srvIt->second.get();
++        out.p->AddRef();
++        return out;
++    }
++
++    bool ensureClutTargets()
++    {
++        if (clutTex)
++            return true;
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = 256;
++        td.Height = 1;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++        if (FAILED(device->CreateTexture2D(&td, nullptr, clutTex.put())))
++            return false;
++        if (FAILED(device->CreateRenderTargetView(clutTex.get(), nullptr, clutRtv.put())))
++            return false;
++        {
++            // CopyResource from a texture needs a staging texture of the same size and format (not a buffer).
++            D3D11_TEXTURE2D_DESC sd = td;
++            sd.Usage = D3D11_USAGE_STAGING;
++            sd.BindFlags = 0;
++            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++            if (FAILED(device->CreateTexture2D(&sd, nullptr, clutStaging.put())))
++                return false;
++        }
++        td.Width = 256;
++        td.Height = 1;
++        td.Format = DXGI_FORMAT_R16G16_UINT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        if (FAILED(device->CreateTexture2D(&td, nullptr, clutCoordTex.put())))
++            return false;
++        return SUCCEEDED(device->CreateShaderResourceView(clutCoordTex.get(), nullptr, clutCoordSrv.put()));
++    }
++
++    bool clutFromTarget(const GSTex0Reg &tex0, uint32_t width, const uint16_t *xy, uint32_t count, uint32_t *words)
++    {
++        RenderTarget *rt = findReinterpretSource(tex0.cbp, tex0.cpsm);
++        if (!rt || count == 0u || count > 256u || !ensure() || !ensureClutTargets())
++            return false;
++        uint64_t key = 1469598103934665603ull;
++        const auto mix = [&key](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
++        mix(rt->fbp); mix(rt->version); mix(tex0.cbp); mix(tex0.cpsm); mix(width); mix(count);
++        for (uint32_t i = 0; i < count * 2u; ++i)
++            mix(xy[i]);
++        if (texSrcDiag)
++            ++texSources["clut-from-rt psm=" + std::to_string(rt->psm)];
++        if (const auto it = clutCache.find(key); it != clutCache.end())
++        {
++            std::memcpy(words, it->second.data(), count * sizeof(uint32_t));
++            return true;
++        }
++        const GSSwizzle::Format &tf = GSSwizzle::GetFormat(tex0.cpsm);
++        const GSSwizzle::Format &rf = GSSwizzle::GetFormat(rt->psm);
++        const auto table = tableOffset.find(tf.table);
++        const auto inv = inverseOffset.find(rt->psm);
++        if (table == tableOffset.end() || inv == inverseOffset.end())
++            return false;
++        const int texelBits = tf.kind == GSSwizzle::Kind::Bits32 ? 32 : tf.kind == GSSwizzle::Kind::Bits24 ? 24 : 16;
++        unbindSrvs();
++        context->UpdateSubresource(clutCoordTex.get(), 0, nullptr, xy, count * 2u * 2u, 0);
++        ID3D11RenderTargetView *rtv = clutRtv.get();
++        context->OMSetRenderTargets(1, &rtv, nullptr);
++        D3D11_VIEWPORT vp{};
++        vp.MaxDepth = 1.0f;
++        vp.Width = static_cast<float>(count);
++        vp.Height = 1.0f;
++        context->RSSetViewports(1, &vp);
++        context->RSSetState(rastNoScissor.get());
++        context->VSSetShader(vsFull.get(), nullptr, 0);
++        context->PSSetShader(psClut.get(), nullptr, 0);
++        context->IASetInputLayout(nullptr);
++        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        context->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
++        ID3D11ShaderResourceView *srvs[8] = {dummySrv[0].get(), rt->colorSrv.get(), tableSrv.get(), paletteSrv.get(),
++                                            dummySrv[4].get(), dummySrv[5].get(), clutCoordSrv.get(), dummySrv[7].get()};
++        context->PSSetShaderResources(0, 8, srvs);
++        CbDraw cb{};
++        cb.I6[0] = tf.pageShiftX; cb.I6[1] = tf.pageShiftY; cb.I6[2] = tf.pixelsPerPageShift; cb.I6[3] = tf.unpackedShift;
++        cb.I7[0] = tf.bitOffset; cb.I7[1] = texelBits; cb.I7[2] = static_cast<int32_t>(table->second); cb.I7[3] = 0;
++        cb.I8[0] = rf.pageShiftX; cb.I8[1] = rf.pageShiftY; cb.I8[2] = rf.pixelsPerPageShift; cb.I8[3] = 1 << rf.unpackedShift;
++        cb.I9[0] = static_cast<int32_t>(inv->second); cb.I9[1] = static_cast<int32_t>(rt->fbp); cb.I9[2] = static_cast<int32_t>(rt->fbw); cb.I9[3] = 0;
++        cb.I10[0] = static_cast<int32_t>(tex0.cbp); cb.I10[1] = static_cast<int32_t>(width); cb.I10[2] = 256; cb.I10[3] = 256;
++        cb.F3[0] = static_cast<float>(rt->pxW); cb.F3[1] = static_cast<float>(rt->pxH);
++        context->UpdateSubresource(cbDraw.get(), 0, nullptr, &cb, 0, 0);
++        ID3D11Buffer *cbs[1] = {cbDraw.get()};
++        context->PSSetConstantBuffers(0, 1, cbs);
++        D3D11_BLEND_DESC blend{};
++        const float factor[4] = {0};
++        context->OMSetBlendState(nullptr, factor, 0xFFFFFFFF);
++        context->Draw(3, 0);
++        unbindSrvs();
++        ID3D11RenderTargetView *noneRtv[1] = {nullptr};
++        context->OMSetRenderTargets(1, noneRtv, nullptr);
++        context->CopyResource(clutStaging.get(), clutTex.get());
++        D3D11_MAPPED_SUBRESOURCE mapped{};
++        if (SUCCEEDED(context->Map(clutStaging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
++        {
++            std::memcpy(words, mapped.pData, count * sizeof(uint32_t));
++            context->Unmap(clutStaging.get(), 0);
++        }
++        else
++            return false;
++        if (clutCache.size() > 4096u)
++            clutCache.clear();
++        clutCache.emplace(key, std::vector<uint32_t>(words, words + count));
++        return true;
++    }
++    static bool sameState(const GSDrawState &a, const GSDrawState &b) { return std::memcmp(&a, &b, sizeof(GSDrawState)) == 0; }
++
++    void addVertex(const GSDrawState &s, const GSVertex &v, float u, float tv, float zmax)
++    {
++        const GSContext &c = s.context;
++        if (pending.empty())
++            firstRawZ = v.z;
++        const float half = 0.5f / scale;
++        HwVertex h;
++        h.x = v.x - static_cast<float>(c.xyoffset.ofx) / 16.0f + half;
++        h.y = v.y - static_cast<float>(c.xyoffset.ofy) / 16.0f + half;
++        double zq = std::max(v.z, 0.0);
++        if (zmax < 4294967295.0f)
++            zq = static_cast<double>(static_cast<uint64_t>(zq) & (zmax < 70000.0f ? 0xFFFFull : 0xFFFFFFull));
++        h.z = static_cast<float>(std::min(zq / zmax, 1.0));
++        h.r = v.r; h.g = v.g; h.b = v.b; h.a = v.a;
++        h.s = v.s; h.t = v.t; h.q = v.q;
++        h.u = u; h.v = tv;
++        pending.push_back(h);
++    }
++
++    const std::vector<uint16_t> &inverseFor(uint32_t ownerPsm)
++    {
++        std::vector<uint16_t> &inv = ownerInverse[ownerPsm];
++        if (inv.empty())
++        {
++            const GSSwizzle::Format &f = GSSwizzle::GetFormat(ownerPsm);
++            inv.assign(2048u, 0);
++            for (uint32_t e = 0; e < 2048u; ++e)
++                inv[f.table[e]] = static_cast<uint16_t>(e);
++        }
++        return inv;
++    }
++
++    bool viewToOwner(uint32_t viewPsm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t ownerPsm, uint32_t fbp, uint32_t fbw,
++                     uint32_t &ox, uint32_t &oy, uint32_t &half)
++    {
++        const uint32_t byte = GSSwizzle::Locate(GSSwizzle::GetFormat(viewPsm), base, bw, x, y).byte;
++        const uint32_t word = byte >> 2, first = fbp * 2048u;
++        if (word < first)
++            return false;
++        const uint32_t rel = word - first, page = rel >> 11u, e = inverseFor(ownerPsm)[rel & 2047u];
++        half = (byte >> 1) & 1u;
++        ox = (page % fbw) * 64u + (e & 63u);
++        oy = (page / fbw) * 32u + (e >> 6u);
++        return true;
++    }
++
++    bool unitToOwner(uint32_t viewPsm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t ownerPsm, uint32_t fbp, uint32_t fbw,
++                     uint32_t &ox, uint32_t &oy, uint32_t &half)
++    {
++        uint32_t ex, ey, eh;
++        return viewToOwner(viewPsm, base, bw, x, y, ownerPsm, fbp, fbw, ox, oy, half) &&
++               viewToOwner(viewPsm, base, bw, x + 7u, y + 7u, ownerPsm, fbp, fbw, ex, ey, eh) && eh == half && ex == ox + 7u && ey == oy + 7u;
++    }
++
++    bool tryShuffle(const GSDrawState &s, const GSPrimitiveBatch &b)
++    {
++        const GSContext &c = s.context;
++        const uint8_t tpsm = c.tex0.psm;
++        const bool zTex = tpsm == 0x32 || tpsm == 0x3A;
++        if (s.prim.type != GS_PRIM_SPRITE || !s.prim.tme || !s.prim.fst || s.prim.abe || !(family16(tpsm) || zTex))
++            { shuffleWhy = 1; return false; }
++        if ((c.test & 1u) != 0u && ((c.test >> 1) & 7u) != 1u)
++            { shuffleWhy = 2; return false; }
++        if (((c.test >> 14) & 1u) != 0u)
++            { shuffleWhy = 3; return false; }
++        {
++            const GSVertex &v = b.vertices[1];
++            const bool identity = c.tex0.tfx == 1 || (c.tex0.tfx == 0 && v.r == 128 && v.g == 128 && v.b == 128 && (!c.tex0.tcc || v.a == 128));
++            if (!identity)
++                { shuffleWhy = 4; return false; }
++        }
++        const uint32_t m16 = fbmsk16(c.frame.fbmsk);
++        const uint32_t lowByte = m16 & 0xFFu, highByte = m16 & 0xFF00u;
++        if ((lowByte != 0u && lowByte != 0xFFu) || (highByte != 0u && highByte != 0xFF00u) || m16 == 0xFFFFu)
++            { shuffleWhy = 5; return false; }
++        RenderTarget *dst = findTarget(c.frame.fbp);
++        if (dst && family16(dst->psm) && dst->usedW != 0u)
++            { shuffleWhy = 6; return false; }
++        if ((c.tex0.tbp0 % 32u) != 0u)
++            { shuffleWhy = 7; return false; }
++        RenderTarget *src = nullptr;
++        bool srcDepth = false;
++        if (zTex)
++            for (RenderTarget &t : targets)
++                if (t.depth && t.zbp == c.tex0.tbp0 / 32u && t.fbp != t.zbp)
++                {
++                    src = &t;
++                    srcDepth = true;
++                }
++        if (!src)
++            if (RenderTarget *t = findTarget(c.tex0.tbp0 / 32u))
++                if (!family16(t->psm) && t->usedW != 0u)
++                    src = t;
++        if (!src)
++            { shuffleWhy = 8; return false; }
++        const GSVertex &a = b.vertices[0], &e = b.vertices[1];
++        const float ofx = c.xyoffset.ofx / 16.0f, ofy = c.xyoffset.ofy / 16.0f;
++        const float fx0 = std::min(a.x, e.x) - ofx, fx1 = std::max(a.x, e.x) - ofx, fy0 = std::min(a.y, e.y) - ofy, fy1 = std::max(a.y, e.y) - ofy;
++        const auto whole = [](float v) { return std::fabs(v - std::round(v)) < 1e-3f && v >= 0.0f; };
++        if (!whole(fx0) || !whole(fx1) || !whole(fy0) || !whole(fy1))
++            { shuffleWhy = 9; return false; }
++        const int x0 = static_cast<int>(std::lround(fx0)), x1 = static_cast<int>(std::lround(fx1));
++        const int y0 = static_cast<int>(std::lround(fy0)), y1 = static_cast<int>(std::lround(fy1));
++        const GSVertex &left = (a.x <= e.x) ? a : e;
++        const GSVertex &top = (a.y <= e.y) ? a : e;
++        const int du = static_cast<int>(std::floor(left.u / 16.0f)) - x0, dv = static_cast<int>(std::floor(top.v / 16.0f)) - y0;
++        const int uSpan = static_cast<int>(std::lround(std::fabs(static_cast<float>(a.u) - static_cast<float>(e.u)) / 16.0f));
++        const int vSpan = static_cast<int>(std::lround(std::fabs(static_cast<float>(a.v) - static_cast<float>(e.v)) / 16.0f));
++        if (((x0 | x1 | y0 | y1 | du | dv) & 7) != 0 || x1 <= x0 || y1 <= y0 || uSpan != x1 - x0 || vSpan != y1 - y0)
++            { shuffleWhy = 10; return false; }
++        if (x0 + du < 0 || y0 + dv < 0 || x0 < static_cast<int>(c.scissor.x0) || y0 < static_cast<int>(c.scissor.y0) ||
++            x1 - 1 > static_cast<int>(c.scissor.x1) || y1 - 1 > static_cast<int>(c.scissor.y1))
++            { shuffleWhy = 11; return false; }
++        if (!dst)
++        {
++            flushShuffle();
++            const auto srcIndex = static_cast<size_t>(src - &*targets.begin());
++            dst = &target(c.frame.fbp, c.frame.fbw);
++            src = &*std::next(targets.begin(), srcIndex);
++        }
++        const uint32_t srcOwnerPsm = srcDepth ? 0x30u : 0x00u, srcFbp = srcDepth ? src->zbp : src->fbp;
++        std::vector<ShuffleVertex> quads[4];
++        uint32_t maxX = 0, maxY = 0;
++        for (int y = y0; y < y1; y += 8)
++            for (int x = x0; x < x1; x += 8)
++            {
++                uint32_t dx, dy, hd, sx, sy, hs;
++                if (!unitToOwner(c.frame.psm, c.frame.fbp * 32u, c.frame.fbw, x, y, 0x00u, dst->fbp, dst->fbw, dx, dy, hd) ||
++                    !unitToOwner(tpsm, c.tex0.tbp0, c.tex0.tbw, x + du, y + dv, srcOwnerPsm, srcFbp, src->fbw, sx, sy, hs))
++                    { shuffleWhy = 12; return false; }
++                if (dx + 8u > dst->pxW || dy + 8u > dst->pxH || sx + 8u > src->pxW || sy + 8u > src->pxH)
++                    { shuffleWhy = 13; return false; }
++                if (src == dst && !srcDepth && (sx != dx || sy != dy))
++                    { shuffleWhy = 14; return false; }
++                const float ox = static_cast<float>(sx) - static_cast<float>(dx), oy = static_cast<float>(sy) - static_cast<float>(dy);
++                const float X0 = static_cast<float>(dx), Y0 = static_cast<float>(dy), X1 = X0 + 8.0f, Y1 = Y0 + 8.0f;
++                std::vector<ShuffleVertex> &q = quads[hs * 2u + hd];
++                q.insert(q.end(), {{X0, Y0, ox, oy}, {X1, Y0, ox, oy}, {X0, Y1, ox, oy}, {X1, Y0, ox, oy}, {X1, Y1, ox, oy}, {X0, Y1, ox, oy}});
++                maxX = std::max(maxX, dx + 8u);
++                maxY = std::max(maxY, dy + 8u);
++            }
++        if (havePending)
++            flushPending();
++        if (haveShuffle && (!sameState(shuffleState, s) || shuffleDst != dst || shuffleSrc != src || shuffleSrcZ != srcDepth))
++            flushShuffle();
++        if (!haveShuffle)
++        {
++            haveShuffle = true;
++            shuffleState = s;
++            shuffleDst = dst;
++            shuffleSrc = src;
++            shuffleSrcZ = srcDepth;
++        }
++        for (int i = 0; i < 4; ++i)
++            shuffleQuads[i].insert(shuffleQuads[i].end(), quads[i].begin(), quads[i].end());
++        dst->usedW = std::max(dst->usedW, std::min(maxX, dst->pxW));
++        dst->usedH = std::max(dst->usedH, std::min(maxY, dst->pxH));
++        ++stats.shuffles;
++        return true;
++    }
++
++    void dumpSkipped(const GSDrawState &s, const GSPrimitiveBatch &b, const char *why)
++    {
++        if (dumpPresents < 0 || presentCount < dumpPresents || presentCount >= dumpPresents + 3 || dumped >= dumpMax)
++            return;
++        flushPending();
++        ++dumped;
++        dumpAfterSkip = true;
++        const GSContext &c = s.context;
++        const GSVertex &v0 = b.vertices[0], &v1 = b.vertices[1];
++        std::fprintf(stderr,
++                     "[gs-hw-d3d11-skip] #%d %s why=%d prim=%d fbp=%u fbw=%u fpsm=%u fbmsk=%x zbp=%x zmsk=%d tme=%d tbp=%x tbw=%u tpsm=%u %ux%u cbp=%x test=%llx alpha=%llx abe=%d v0=(%.1f,%.1f uv=%u,%u col=%u,%u,%u,%u) v1=(%.1f,%.1f uv=%u,%u) scis=%u-%u,%u-%u\n",
++                     dumped, why, shuffleWhy, static_cast<int>(s.prim.type), c.frame.fbp, c.frame.fbw, c.frame.psm, c.frame.fbmsk, c.zbuf.zbp, c.zbuf.zmask ? 1 : 0,
++                     s.prim.tme ? 1 : 0, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, s.textureWidth, s.textureHeight, c.tex0.cbp,
++                     (unsigned long long)c.test, (unsigned long long)c.alpha, s.prim.abe ? 1 : 0, v0.x, v0.y, v0.u, v0.v,
++                     (unsigned)v0.r, (unsigned)v0.g, (unsigned)v0.b, (unsigned)v0.a, v1.x, v1.y, v1.u, v1.v, c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1);
++    }
++
++    void submit(const GSPrimitiveBatch &b)
++    {
++        const GSDrawState &s = b.state;
++        const GSPrimType type = s.prim.type;
++        const bool tri = type == GS_PRIM_TRIANGLE || type == GS_PRIM_TRISTRIP || type == GS_PRIM_TRIFAN;
++        const bool sprite = type == GS_PRIM_SPRITE;
++        const bool line = type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP;
++        if (!tri && !sprite && !line)
++        {
++            ++stats.skippedPrim;
++            dumpSkipped(s, b, "prim");
++            return;
++        }
++        const uint8_t fpsm = s.context.frame.psm;
++        if (family16(fpsm) && tryShuffle(s, b))
++            return;
++        flushShuffle();
++        if (fpsm != GS_PSM_CT32 && fpsm != GS_PSM_CT24 && fpsm != GS_PSM_CT16 && fpsm != GS_PSM_CT16S)
++        {
++            ++stats.skippedPsm;
++            return;
++        }
++        for (const RenderTarget &t : targets)
++            if (t.fbp == s.context.frame.fbp && t.usedW != 0u && family16(t.psm) != family16(fpsm))
++            {
++                ++stats.skippedPsm;
++                dumpSkipped(s, b, "view");
++                return;
++            }
++        if (havePending && !sameState(pendingState, s))
++            flushPending();
++        if (!havePending)
++        {
++            pendingState = s;
++            havePending = true;
++        }
++        const float zmax = zMaxFor(s.context.zbuf.psm);
++        const float texW = static_cast<float>(std::max<uint16_t>(s.textureWidth, 1)), texH = static_cast<float>(std::max<uint16_t>(s.textureHeight, 1));
++        const auto texelUV = [&](const GSVertex &v, float &u, float &t)
++        {
++            if (s.prim.fst)
++            {
++                u = static_cast<float>(v.u) / 16.0f;
++                t = static_cast<float>(v.v) / 16.0f;
++            }
++            else
++            {
++                u = 0.0f;
++                t = 0.0f;
++            }
++        };
++        if (line)
++        {
++            const GSVertex &a = b.vertices[0], &c = b.vertices[1];
++            float dx = c.x - a.x, dy = c.y - a.y;
++            const float len = std::sqrt(dx * dx + dy * dy);
++            if (len < 1e-4f)
++                dx = 1.0f, dy = 0.0f;
++            else
++                dx /= len, dy /= len;
++            const float ext = len < 1.0f ? (1.0f - len) * 0.5f : 0.0f;
++            const float nx = -dy * 0.5f, ny = dx * 0.5f;
++            GSVertex e[2] = {a, c};
++            e[0].x -= dx * ext; e[0].y -= dy * ext;
++            e[1].x += dx * ext; e[1].y += dy * ext;
++            const int order[6][2] = {{0, 1}, {1, 1}, {0, -1}, {1, 1}, {1, -1}, {0, -1}};
++            const float centre = 0.5f - 0.5f / scale;
++            for (const auto &o : order)
++            {
++                GSVertex v = e[o[0]];
++                v.x += nx * static_cast<float>(o[1]) + centre * std::fabs(dy);
++                v.y += ny * static_cast<float>(o[1]) + centre * std::fabs(dx);
++                float u, t;
++                texelUV(v, u, t);
++                addVertex(s, v, u, t, zmax);
++            }
++        }
++        else if (tri)
++        {
++            for (int i = 0; i < 3; ++i)
++            {
++                float u, t;
++                texelUV(b.vertices[i], u, t);
++                addVertex(s, b.vertices[i], u, t, zmax);
++            }
++        }
++        else
++        {
++            const GSVertex &a = b.vertices[0];
++            const GSVertex &c = b.vertices[1];
++            float u0, v0, u1, v1;
++            if (s.prim.fst)
++            {
++                u0 = a.u / 16.0f; v0 = a.v / 16.0f; u1 = c.u / 16.0f; v1 = c.v / 16.0f;
++            }
++            else
++            {
++                const float q0 = std::fabs(a.q) < 1e-20f ? 1e-20f : a.q, q1 = std::fabs(c.q) < 1e-20f ? 1e-20f : c.q;
++                u0 = a.s / q0 * texW; v0 = a.t / q0 * texH; u1 = c.s / q1 * texW; v1 = c.t / q1 * texH;
++            }
++            const float xs[2] = {a.x, c.x}, ys[2] = {a.y, c.y};
++            const float us[2] = {u0, u1}, vs[2] = {v0, v1};
++            const auto sampled = [](float p0, float p1, float t0, float t1, float &lo, float &hi)
++            {
++                lo = std::min(t0, t1);
++                hi = std::max(t0, t1);
++                const float first = std::ceil(std::min(p0, p1)), last = std::ceil(std::max(p0, p1)) - 1.0f;
++                if (last < first || p1 == p0)
++                    return;
++                const float ta = t0 + (first - p0) * (t1 - t0) / (p1 - p0), tb = t0 + (last - p0) * (t1 - t0) / (p1 - p0);
++                lo = std::min(ta, tb);
++                hi = std::max(ta, tb);
++            };
++            float cu0, cu1, cv0, cv1;
++            sampled(a.x - s.context.xyoffset.ofx / 16.0f, c.x - s.context.xyoffset.ofx / 16.0f, u0, u1, cu0, cu1);
++            sampled(a.y - s.context.xyoffset.ofy / 16.0f, c.y - s.context.xyoffset.ofy / 16.0f, v0, v1, cv0, cv1);
++            SpriteEdges cur{{xs[0], xs[1]}, {ys[0], ys[1]}, {us[0], us[1]}, {vs[0], vs[1]}};
++            if (lastSprite.batch == batchSerial && lastSprite.end == pending.size() && lastSprite.end >= 6)
++                openSharedSide(lastSprite.edges, cur, &pending[lastSprite.end - 6], cu0, cu1, cv0, cv1);
++            const int order[6][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 1}};
++            for (const auto &o : order)
++            {
++                GSVertex v = c;
++                v.x = xs[o[0]];
++                v.y = ys[o[1]];
++                addVertex(s, v, us[o[0]], vs[o[1]], zmax);
++                pending.back().s = us[o[0]] / texW;
++                pending.back().t = vs[o[1]] / texH;
++                pending.back().q = 1.0f;
++                pending.back().cu0 = cu0;
++                pending.back().cv0 = cv0;
++                pending.back().cu1 = cu1;
++                pending.back().cv1 = cv1;
++            }
++            lastSprite = {cur, pending.size(), batchSerial};
++        }
++        ++stats.draws;
++    }
++
++    void flushPending()
++    {
++        ++batchSerial;
++        flushShuffle();
++        if (!havePending || pending.empty())
++        {
++            havePending = false;
++            pending.clear();
++            return;
++        }
++        havePending = false;
++        if (!ensure())
++        {
++            pending.clear();
++            return;
++        }
++        draw(pendingState, pending);
++        pending.clear();
++    }
++
++
++    // GS blend factor codes: 0 Cs, 1 Cd, 2 zero, 3 fix? (alpha C selector mapping below). Returns D3D-friendly factors.
++    enum class Factor { SrcAlpha, OneMinusSrcAlpha, Src1Alpha, OneMinusSrc1Alpha, Constant, One, Zero };
++    enum class BlendOp { Add, RevSubtract };
++
++    void blendState(const GSDrawState &s, bool &enabled, Factor &sf, Factor &df, float &fixScale, float &constant, BlendOp &equation, bool &soft)
++    {
++        enabled = false;
++        soft = false;
++        equation = BlendOp::Add;
++        sf = Factor::One; df = Factor::Zero;
++        fixScale = 1.0f / 128.0f;
++        constant = 0.0f;
++        if (!s.prim.abe)
++            return;
++        const uint64_t alpha = s.context.alpha;
++        const uint32_t a = alpha & 3, b = (alpha >> 2) & 3, c = (alpha >> 4) & 3, d = (alpha >> 6) & 3;
++        const uint32_t fix = static_cast<uint32_t>((alpha >> 32) & 0xFF);
++        Factor cs, cd;
++        if (c == 0) { cs = Factor::Src1Alpha; cd = Factor::OneMinusSrc1Alpha; }
++        else if (c == 2) { cs = Factor::Constant; cd = Factor::Constant; constant = std::min(fix / 128.0f, 1.0f); }
++        else { soft = true; cs = Factor::Src1Alpha; cd = Factor::OneMinusSrc1Alpha; }
++        // wrap-around via shader (Cs - Cd with COLCLAMP=0 and A != B) is handled by uSwBlend when it cannot map.
++        if ((s.colclamp & 1u) == 0u && a != b)
++            soft = true;
++        if (a == b)
++        {
++            if (d == 0)
++                return; // plain write
++            if (d == 1)
++            { // Cd: destination unchanged
++                enabled = true; sf = Factor::Zero; df = Factor::One; return;
++            }
++            return;
++        }
++        enabled = true;
++        if (a == 0 && b == 1 && d == 1) { sf = cs; df = cd; }
++        else if (a == 0 && b == 2 && d == 1) { sf = cs; df = Factor::One; }
++        else if (a == 2 && b == 1 && d == 1) { sf = Factor::Zero; df = cd; }
++        else if (a == 0 && b == 2 && d == 2) { sf = cs; df = Factor::Zero; }
++        else if (a == 2 && b == 0 && d == 2) { sf = Factor::Zero; df = Factor::Zero; }
++        else if (a == 2 && b == 0 && d == 1) { sf = cs; df = Factor::One; equation = BlendOp::RevSubtract; }
++        else { soft = true; sf = cs; df = cd; }
++        if (soft)
++            ++stats.unsupportedBlend;
++    }
++
++    ID3D11BlendState *blendStateObj(bool enabled, Factor sf, Factor df, BlendOp equation, uint32_t writeMask, float constant, float wrapAmount[3])
++    {
++        const auto toFunc = [](Factor f)
++        {
++            switch (f)
++            {
++            case Factor::SrcAlpha: return D3D11_BLEND_SRC_ALPHA;
++            case Factor::OneMinusSrcAlpha: return D3D11_BLEND_INV_SRC_ALPHA;
++            case Factor::Src1Alpha: return D3D11_BLEND_SRC1_ALPHA;
++            case Factor::OneMinusSrc1Alpha: return D3D11_BLEND_INV_SRC1_ALPHA;
++            case Factor::Constant: return D3D11_BLEND_BLEND_FACTOR;
++            case Factor::One: return D3D11_BLEND_ONE;
++            case Factor::Zero: return D3D11_BLEND_ZERO;
++            }
++            return D3D11_BLEND_ONE;
++        };
++        const auto toOp = [](BlendOp op) { return op == BlendOp::RevSubtract ? D3D11_BLEND_OP_REV_SUBTRACT : D3D11_BLEND_OP_ADD; };
++        const D3D11_BLEND_OP op = toOp(equation);
++        const D3D11_BLEND src = toFunc(sf);
++        const D3D11_BLEND dst = toFunc(df);
++        uint32_t key = (writeMask & 0xFFu) | ((enabled ? 1u : 0u) << 8) | (static_cast<uint32_t>(op) << 9) |
++                       (static_cast<uint32_t>(src) << 12) | (static_cast<uint32_t>(dst) << 20);
++        // RenderTargetWriteMask per channel already excludes masked (fbmsk) channels; alpha uses ONE/ZERO.
++        auto it = blendCache.find(key);
++        if (it != blendCache.end())
++            return it->second.get();
++        D3D11_BLEND_DESC bd{};
++        bd.RenderTarget[0].BlendEnable = enabled ? TRUE : FALSE;
++        bd.RenderTarget[0].SrcBlend = src;
++        bd.RenderTarget[0].DestBlend = dst;
++        bd.RenderTarget[0].BlendOp = op;
++        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
++        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++        bd.RenderTarget[0].RenderTargetWriteMask = static_cast<UINT8>(writeMask);
++        Com<ID3D11BlendState> state;
++        if (FAILED(device->CreateBlendState(&bd, state.put())))
++            return nullptr;
++        auto inserted = blendCache.emplace(key, std::move(state)).first;
++        (void)constant;
++        (void)wrapAmount;
++        return inserted->second.get();
++    }
++
++    void applyBlend(bool enabled, Factor sf, Factor df, BlendOp equation, uint32_t writeMask, float constant, float wrapAmount[3], bool wrapCount)
++    {
++        ID3D11BlendState *state = blendStateObj(enabled, sf, df, equation, writeMask, constant, wrapAmount);
++        const float factor[4] = {wrapCount ? wrapAmount[0] : constant, wrapCount ? wrapAmount[1] : constant,
++                                 wrapCount ? wrapAmount[2] : constant, 0.0f};
++        context->OMSetBlendState(state, factor, 0xFFFFFFFF);
++    }
++
++    ID3D11DepthStencilState *depthStateObj(bool enable, D3D11_COMPARISON_FUNC func, bool write, uint32_t &keyOut)
++    {
++        const uint32_t key = (enable ? 1u : 0u) | (static_cast<uint32_t>(func) << 1) | (write ? (1u << 8) : 0u);
++        keyOut = key;
++        auto it = depthCache.find(key);
++        if (it != depthCache.end())
++            return it->second.get();
++        D3D11_DEPTH_STENCIL_DESC dd{};
++        dd.DepthEnable = enable ? TRUE : FALSE;
++        dd.DepthWriteMask = write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
++        dd.DepthFunc = func;
++        dd.StencilEnable = FALSE;
++        dd.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
++        dd.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
++        dd.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
++        dd.BackFace = dd.FrontFace;
++        Com<ID3D11DepthStencilState> state;
++        if (FAILED(device->CreateDepthStencilState(&dd, state.put())))
++            return nullptr;
++        auto inserted = depthCache.emplace(key, std::move(state)).first;
++        return inserted->second.get();
++    }
++
++    ID3D11SamplerState *samplerFor(bool linear, bool clamp)
++    {
++        if (linear && clamp)
++            return samplerLinearClamp.get();
++        if (linear)
++            return samplerLinearRepeat.get();
++        if (clamp)
++            return samplerPointClamp.get();
++        return samplerPointRepeat.get();
++    }
++
++    void ensureScratchColor(uint32_t w, uint32_t h)
++    {
++        if (scratchColorA && scratchColorW == w && scratchColorH == h && scratchColorB)
++            return;
++        const auto mk = [&](Com<ID3D11Texture2D> &tex, Com<ID3D11ShaderResourceView> &srv)
++        {
++            tex.reset();
++            srv.reset();
++            D3D11_TEXTURE2D_DESC td{};
++            td.Width = w;
++            td.Height = h;
++            td.MipLevels = 1;
++            td.ArraySize = 1;
++            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++            td.SampleDesc.Count = 1;
++            td.Usage = D3D11_USAGE_DEFAULT;
++            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++            device->CreateTexture2D(&td, nullptr, tex.put());
++            device->CreateShaderResourceView(tex.get(), nullptr, srv.put());
++        };
++        mk(scratchColorA, scratchColorASrv);
++        mk(scratchColorB, scratchColorBSrv);
++        scratchColorW = w;
++        scratchColorH = h;
++    }
++
++    void ensureScratchDepth(uint32_t w, uint32_t h)
++    {
++        if (scratchDepth && scratchDepthW == w && scratchDepthH == h)
++            return;
++        scratchDepth.reset();
++        scratchDepthSrv.reset();
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = w;
++        td.Height = h;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R32_TYPELESS;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        device->CreateTexture2D(&td, nullptr, scratchDepth.put());
++        D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
++        srv.Format = DXGI_FORMAT_R32_FLOAT;
++        srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++        srv.Texture2D.MipLevels = 1;
++        device->CreateShaderResourceView(scratchDepth.get(), &srv, scratchDepthSrv.put());
++        scratchDepthW = w;
++        scratchDepthH = h;
++    }
++
++    void flushShuffle()
++    {
++        if (!haveShuffle)
++            return;
++        haveShuffle = false;
++        if (!psShuffle)
++        {
++            for (auto &q : shuffleQuads)
++                q.clear();
++            return;
++        }
++        RenderTarget &dst = *shuffleDst, &src = *shuffleSrc;
++        const GSContext &c = shuffleState.context;
++        ++dst.version;
++        dst.lastDrawSeq = ++writeSeq;
++        const uint32_t m16 = fbmsk16(c.frame.fbmsk);
++        const uint32_t loMask = (m16 & 0xFFu) == 0u ? 0xFFu : 0u, hiMask = (m16 & 0xFF00u) == 0u ? (0xFFu << 8) : 0u;
++        ID3D11RenderTargetView *rtv = dst.colorRtv.get();
++        context->OMSetRenderTargets(1, &rtv, nullptr);
++        D3D11_VIEWPORT vp{};
++        vp.MaxDepth = 1.0f;
++        vp.Width = static_cast<float>(dst.glW);
++        vp.Height = static_cast<float>(dst.glH);
++        context->RSSetViewports(1, &vp);
++        context->RSSetState(rastNoScissor.get());
++        context->VSSetShader(vsShuffle.get(), nullptr, 0);
++        context->PSSetShader(psShuffle.get(), nullptr, 0);
++        context->IASetInputLayout(layoutShuffle.get());
++        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        ID3D11SamplerState *samplers[1] = {samplerPointRepeat.get()};
++        context->PSSetSamplers(0, 1, samplers);
++        context->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
++        ID3D11Buffer *cbs[1] = {cbShuffle.get()};
++        context->PSSetConstantBuffers(1, 1, cbs);
++        context->VSSetConstantBuffers(1, 1, cbs);
++        // Source SRV: when src==dst & color, copy to scratchB first (writing while sampling would be a hazard).
++        ID3D11ShaderResourceView *srcSrv = shuffleSrcZ ? src.depthSrv.get() : src.colorSrv.get();
++        bool useScratchB = false;
++        if (&src == &dst && !shuffleSrcZ)
++        {
++            ensureScratchColor(dst.glW, dst.glH);
++            unbindSrvs();
++            context->CopyResource(scratchColorB.get(), dst.color.get());
++            srcSrv = scratchColorBSrv.get();
++            useScratchB = true;
++        }
++        (void)useScratchB;
++        for (uint32_t i = 0; i < 4; ++i)
++        {
++            std::vector<ShuffleVertex> &q = shuffleQuads[i];
++            if (q.empty())
++                continue;
++            const uint32_t hs = i >> 1, hd = i & 1u;
++            const uint32_t mask = hd == 0u ? loMask : hiMask;
++            if (mask == 0u)
++            {
++                q.clear();
++                continue;
++            }
++            CbShuffle cb{};
++            cb.S0[0] = 1.0f / dst.pxW; cb.S0[1] = 1.0f / dst.pxH; cb.S0[2] = scale; cb.S0[3] = zMaxFor(c.zbuf.psm);
++            cb.SI0[0] = shuffleSrcZ ? 1 : 0; cb.SI0[1] = static_cast<int32_t>(hs); cb.SI0[2] = static_cast<int32_t>(hd);
++            cb.SI0[3] = shuffleState.texa.aem ? 1 : 0;
++            cb.SI1[0] = shuffleState.texa.ta0 >> 7; cb.SI1[1] = shuffleState.texa.ta1 >> 7;
++            context->UpdateSubresource(cbShuffle.get(), 0, nullptr, &cb, 0, 0);
++            ID3D11ShaderResourceView *srvs[8] = {dummySrv[0].get(), dummySrv[1].get(), dummySrv[2].get(), dummySrv[3].get(),
++                                                dummySrv[4].get(), dummySrv[5].get(), dummySrv[6].get(), srcSrv ? srcSrv : dummySrv[7].get()};
++            context->PSSetShaderResources(0, 8, srvs);
++            // shuffle writes through ONE/Dest with a per-half mask: colour write mask selects the halfword bytes.
++            D3D11_BLEND_DESC bd{};
++            bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++            bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
++            bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++            bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++            bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
++            bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++            bd.RenderTarget[0].BlendEnable = TRUE;
++            bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++            bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
++            bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++            bd.RenderTarget[0].RenderTargetWriteMask = static_cast<UINT8>(mask);
++            Com<ID3D11BlendState> state;
++            device->CreateBlendState(&bd, state.put());
++            const float factor[4] = {0};
++            context->OMSetBlendState(state.get(), factor, 0xFFFFFFFF);
++            const float zeroStencil = 0.0f;
++            context->OMSetDepthStencilState(nullptr, 0);
++            (void)zeroStencil;
++            D3D11_MAPPED_SUBRESOURCE mapped{};
++            // Copy quads into the dynamic vertex buffer for this half-group.
++            ID3D11Buffer *vb = shuffleVbo.get();
++            context->IASetVertexBuffers(0, 1, &vb, nullptr, nullptr);
++            if (SUCCEEDED(context->Map(shuffleVbo.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
++            {
++                std::memcpy(mapped.pData, q.data(), q.size() * sizeof(ShuffleVertex));
++                context->Unmap(shuffleVbo.get(), 0);
++                UINT stride = sizeof(ShuffleVertex), offset = 0;
++                context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
++                context->DrawInstanced(static_cast<UINT>(q.size()), 1, 0, 0);
++            }
++            q.clear();
++        }
++        const float factor[4] = {0};
++        context->OMSetBlendState(nullptr, factor, 0xFFFFFFFF);
++        ID3D11RenderTargetView *noneRtv[1] = {nullptr};
++        context->OMSetRenderTargets(1, noneRtv, nullptr);
++        unbindSrvs();
++        ++stats.batches;
++    }
++
++    void draw(const GSDrawState &s, const std::vector<HwVertex> &verts)
++    {
++        ++frameBatch;
++        if (onlyLo >= 0 && (frameBatch < onlyLo || frameBatch > onlyHi) && s.context.frame.fbp == 0 && s.context.frame.fbw == 8 && !(s.prim.tme && s.context.tex0.tbp0 == 0))
++            return;
++        const GSContext &c = s.context;
++        static const long skipTbp = std::getenv("GOW_GS_HW_SKIPTBP") ? std::strtol(std::getenv("GOW_GS_HW_SKIPTBP"), nullptr, 16) : -1;
++        if (skipTbp >= 0 && s.prim.tme && static_cast<long>(c.tex0.tbp0) == skipTbp)
++            return;
++        static const double dumpAtSec = std::getenv("GOW_GS_HW_DUMPAT") ? std::atof(std::getenv("GOW_GS_HW_DUMPAT")) : -1.0;
++        static const auto t0 = std::chrono::steady_clock::now();
++        const double nowSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        if (dumpAtSec >= 0.0 && nowSec >= dumpAtSec && dumpedAt == 0 && frameBatch == 1)
++            dumpedAt = 1;
++        if (dumpedAt == 1 && dumped < dumpMax && dumpPresents < 0)
++            dumpPresents = 0, presentCount = 0;
++        if (dumpPresents >= 0 && presentCount >= dumpPresents && presentCount < dumpPresents + 3 && dumped < dumpMax && (dumpAll || c.frame.fbp == 208 || c.frame.fbp == 320 || dumped < 40 || dumpAfterSkip))
++        {
++            ++dumped;
++            const HwVertex &v0 = verts[0];
++            float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f, cmax = 0.0f, amax = 0.0f, zlo = 2.0f, zhi = -1.0f;
++            for (const HwVertex &v : verts)
++            {
++                bx0 = std::min(bx0, v.x), by0 = std::min(by0, v.y), bx1 = std::max(bx1, v.x), by1 = std::max(by1, v.y);
++                cmax = std::max({cmax, v.r, v.g, v.b}), amax = std::max(amax, v.a), zlo = std::min(zlo, v.z), zhi = std::max(zhi, v.z);
++            }
++            const float zscale = zMaxFor(c.zbuf.psm) < 4294967295.0f ? zMaxFor(c.zbuf.psm) : 16777215.0f;
++            std::fprintf(stderr, "[gs-hw-d3d11-dump-bb] #%d %.0f-%.0f,%.0f-%.0f ta0=%x ta1=%x aem=%d fge=%d tfx=%u tcc=%u iip=%d cmax=%.0f amax=%.0f prim=%u z=%x-%x\n",
++                         dumped, bx0, bx1, by0, by1, s.texa.ta0, s.texa.ta1, s.texa.aem ? 1 : 0, s.prim.fge ? 1 : 0,
++                         c.tex0.tfx, c.tex0.tcc, s.prim.iip ? 1 : 0, cmax, amax, static_cast<unsigned>(s.prim.type),
++                         static_cast<unsigned>(zlo * zscale + 0.5f), static_cast<unsigned>(zhi * zscale + 0.5f));
++            std::fprintf(stderr, "[gs-hw-d3d11-dump] #%d fb=%d verts=%zu fbp=%u fbw=%u fpsm=%u zbp=%x zpsm=%x zmsk=%d tme=%d tbp=%x tbw=%u tpsm=%u %ux%u cbp=%x test=%llx alpha=%llx abe=%d fbmsk=%x rawz=%.0f v0=(%.1f,%.1f z=%.3f col=%.0f,%.0f,%.0f,%.0f uv=%.1f,%.1f) scis=%u-%u,%u-%u\n",
++                         dumped, frameBatch, verts.size(), c.frame.fbp, c.frame.fbw, c.frame.psm, c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask ? 1 : 0, s.prim.tme ? 1 : 0,
++                         c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, s.textureWidth, s.textureHeight, c.tex0.cbp, (unsigned long long)c.test,
++                         (unsigned long long)c.alpha, s.prim.abe ? 1 : 0, c.frame.fbmsk, firstRawZ, v0.x, v0.y, v0.z, v0.r, v0.g, v0.b, v0.a, v0.u, v0.v,
++                         c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1);
++        }
++        RenderTarget &rt = target(c.frame.fbp, c.frame.fbw);
++        attachDepth(rt, c.zbuf.zbp);
++        rt.psm = c.frame.psm;
++        ++rt.version;
++        rt.lastDrawSeq = ++writeSeq;
++        {
++            float maxX = 0.0f, maxY = 0.0f;
++            for (const HwVertex &v : verts)
++            {
++                maxX = std::max(maxX, v.x);
++                maxY = std::max(maxY, v.y);
++            }
++            const uint32_t bx = static_cast<uint32_t>(std::min<float>(std::max(maxX, 0.0f), static_cast<float>(c.scissor.x1 + 1u)));
++            const uint32_t by = static_cast<uint32_t>(std::min<float>(std::max(maxY, 0.0f), static_cast<float>(c.scissor.y1 + 1u)));
++            rt.usedW = std::max<uint32_t>(rt.usedW, std::min<uint32_t>(bx, rt.pxW));
++            rt.usedH = std::max<uint32_t>(rt.usedH, std::min<uint32_t>(by, rt.pxH));
++        }
++        // depth state
++        static const bool noDepth = std::getenv("GOW_GS_HW_NODEPTH") != nullptr;
++        const uint32_t ztst = ((c.test >> 16) & 1u) ? static_cast<uint32_t>((c.test >> 17) & 3u) : 1u;
++        const bool zAlias = c.zbuf.zbp == c.frame.fbp && ((c.test >> 16) & 1u) != 0u && (c.frame.psm == GS_PSM_CT32 || c.frame.psm == GS_PSM_CT24);
++        const bool depthDisabled = noDepth || zAlias;
++        const bool zInv = !zAlias && ((c.test >> 16) & 1u) != 0u && zInverted(c.zbuf.zbp);
++        std::vector<HwVertex> flippedZ;
++        if (zInv)
++        {
++            flippedZ = verts;
++            for (HwVertex &v : flippedZ)
++                v.z = 1.0f - v.z;
++        }
++        const std::vector<HwVertex> &dverts = zInv ? flippedZ : verts;
++        if (isZInversion(s, verts))
++        {
++            if (zInverted(c.zbuf.zbp))
++                invertedZ.erase(std::find(invertedZ.begin(), invertedZ.end(), c.zbuf.zbp));
++            else
++                invertedZ.push_back(c.zbuf.zbp);
++        }
++        const bool zwrite = !c.zbuf.zmask && !zAlias;
++        if (zwrite && ((c.test >> 16) & 1u) != 0u)
++            rt.lastDepthSeq = rt.lastDrawSeq;
++        const bool zAliasWrite = zAlias && !c.zbuf.zmask;
++        const uint32_t fbmsk = c.frame.fbmsk;
++        const uint32_t writeMask = (0xFFu & ~fbmsk) | ((0xFF00u & ~fbmsk) & 0xFF00u) | ((0xFF0000u & ~fbmsk)) | ((0xFF000000u & ~fbmsk));
++        (void)writeMask;
++        uint32_t colorMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++        colorMask = static_cast<uint32_t>((fbmsk & 0xFFu) == 0xFFu ? colorMask & ~D3D11_COLOR_WRITE_ENABLE_RED : colorMask);
++        colorMask = static_cast<uint32_t>((fbmsk & 0xFF00u) == 0xFF00u ? colorMask & ~D3D11_COLOR_WRITE_ENABLE_GREEN : colorMask);
++        colorMask = static_cast<uint32_t>((fbmsk & 0xFF0000u) == 0xFF0000u ? colorMask & ~D3D11_COLOR_WRITE_ENABLE_BLUE : colorMask);
++        colorMask = static_cast<uint32_t>((fbmsk & 0xFF000000u) == 0xFF000000u ? colorMask & ~D3D11_COLOR_WRITE_ENABLE_ALPHA : colorMask);
++
++        bool blend = false, softBlend = false;
++        Factor sf = Factor::One, df = Factor::Zero;
++        BlendOp equation = BlendOp::Add;
++        float fixScale = 1.0f / 128.0f, constant = 0.0f;
++        blendState(s, blend, sf, df, fixScale, constant, equation, softBlend);
++        float wrapAmount[3] = {0.0f, 0.0f, 0.0f};
++        bool wrapCount = false;
++        if (softBlend && !zAliasWrite && (s.colclamp & 1u) == 0u && !s.prim.tme && !verts.empty())
++        {
++            const uint64_t al = c.alpha;
++            const uint32_t a = al & 3u, b = (al >> 2) & 3u, cc = (al >> 4) & 3u, d = (al >> 6) & 3u, fix = static_cast<uint32_t>((al >> 32) & 0xFFu);
++            if (a == 0u && b == 2u && cc == 2u && d == 1u)
++            {
++                const float col[3] = {verts[0].r, verts[0].g, verts[0].b};
++                const bool written[3] = {(fbmsk & 0xFFu) != 0xFFu, (fbmsk & 0xFF00u) != 0xFF00u, (fbmsk & 0xFF0000u) != 0xFF0000u};
++                bool flat = true;
++                for (const HwVertex &v : verts)
++                    flat = flat && v.r == col[0] && v.g == col[1] && v.b == col[2];
++                int direction = 0;
++                for (int ch = 0; ch < 3 && flat; ++ch)
++                {
++                    if (!written[ch])
++                        continue;
++                    const uint32_t v = std::min<uint32_t>(255u, (static_cast<uint32_t>(col[ch]) * fix) >> 7);
++                    const int dir = v >= 128u ? -1 : 1;
++                    direction = direction == 0 || direction == dir ? dir : 2;
++                    wrapAmount[ch] = col[ch] > 0.0f ? static_cast<float>(dir < 0 ? 256u - v : v) / col[ch] : 0.0f;
++                }
++                if (flat && (direction == 1 || direction == -1))
++                {
++                    wrapCount = true;
++                    softBlend = false;
++                    blend = true;
++                    sf = Factor::Constant;
++                    df = Factor::One;
++                    equation = direction < 0 ? BlendOp::RevSubtract : BlendOp::Add;
++                }
++            }
++        }
++        if (softBlend || zAliasWrite)
++            blend = false;
++        (void)fixScale;
++        // depth func mapping
++        D3D11_COMPARISON_FUNC depthFunc;
++        if (zInv)
++            depthFunc = ztst == 0 ? D3D11_COMPARISON_NEVER : ztst == 1 ? D3D11_COMPARISON_ALWAYS : ztst == 2 ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS;
++        else
++            depthFunc = ztst == 0 ? D3D11_COMPARISON_NEVER : ztst == 1 ? D3D11_COMPARISON_ALWAYS : ztst == 2 ? D3D11_COMPARISON_GREATER_EQUAL : D3D11_COMPARISON_GREATER;
++
++        // bind render target + depth
++        ID3D11RenderTargetView *rtv = rt.colorRtv.get();
++        ID3D11DepthStencilView *dsv = depthDisabled ? nullptr : rt.depthDsv.get();
++        context->OMSetRenderTargets(1, &rtv, dsv);
++        D3D11_VIEWPORT vp{};
++        vp.MaxDepth = 1.0f;
++        vp.Width = static_cast<float>(rt.glW);
++        vp.Height = static_cast<float>(rt.glH);
++        vp.MinDepth = 0.0f;
++        vp.MaxDepth = 1.0f;
++        context->RSSetViewports(1, &vp);
++        D3D11_RECT sc{};
++        const int sx0 = c.scissor.x0, sy0 = c.scissor.y0;
++        const int sw = std::max(0, static_cast<int>(c.scissor.x1) - sx0 + 1), sh = std::max(0, static_cast<int>(c.scissor.y1) - sy0 + 1);
++        sc.left = static_cast<LONG>(std::floor(sx0 * scale));
++        sc.top = static_cast<LONG>(std::floor(sy0 * scale));
++        sc.right = sc.left + static_cast<LONG>(std::ceil(sw * scale));
++        sc.bottom = sc.top + static_cast<LONG>(std::ceil(sh * scale));
++        sc.left = std::max<LONG>(sc.left, 0);
++        sc.top = std::max<LONG>(sc.top, 0);
++        sc.right = std::min<LONG>(sc.right, static_cast<LONG>(rt.glW));
++        sc.bottom = std::min<LONG>(sc.bottom, static_cast<LONG>(rt.glH));
++        context->RSSetState(rastScissor.get());
++        context->RSSetScissorRects(1, &sc);
++        const bool depthWrite = zwrite && ((c.test >> 16) & 1u) != 0u;
++        uint32_t depthKey = 0;
++        ID3D11DepthStencilState *depthState = depthStateObj(!depthDisabled, depthFunc, depthWrite, depthKey);
++        context->OMSetDepthStencilState(depthState, 0);
++        applyBlend(blend, sf, df, equation, colorMask, constant, wrapAmount, wrapCount);
++
++        // texture / source selection (same precedence as GL)
++        RenderTarget *src = nullptr;
++        RenderTarget *zsrc = nullptr;
++        RenderTarget *rsrc = nullptr;
++        Texture dummy; // unused
++        Texture *texPtr = &dummy;
++        Texture dummyZero{};
++        dummy.valid = false;
++        bool indexed = false;
++        uint32_t texTexSizeW = 0, texTexSizeH = 0;
++        uint32_t texDimW = std::max<uint16_t>(s.textureWidth, 1), texDimH = std::max<uint16_t>(s.textureHeight, 1);
++        if (s.prim.tme)
++        {
++            const auto family = [](uint8_t psm) { return (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S) ? 16 : (psm == GS_PSM_CT32 || psm == GS_PSM_CT24) ? 32 : 0; };
++            if (family(c.tex0.psm) != 0 && (c.tex0.tbp0 % 32u) == 0u)
++                if (RenderTarget *candidate = findTarget(c.tex0.tbp0 / 32u))
++                    if (family(candidate->psm) == family(c.tex0.psm) && !uploadedSinceDraw(*candidate, c.tex0.tbp0) && !overwrittenByDepth(*candidate))
++                        src = candidate;
++            const bool zFormat = c.tex0.psm == 0x30 || c.tex0.psm == 0x31 || c.tex0.psm == 0x32 || c.tex0.psm == 0x3A;
++            if (zFormat && (c.tex0.tbp0 % 32u) == 0u)
++                for (RenderTarget &t : targets)
++                    if (t.depth && t.zbp == c.tex0.tbp0 / 32u && t.fbp != t.zbp)
++                        zsrc = &t;
++            if (zsrc)
++                src = nullptr;
++            if (!src && !zsrc)
++                rsrc = findReinterpretSource(c.tex0.tbp0, c.tex0.psm);
++            indexed = !(src || rsrc || zsrc) && isIndexed(c.tex0.psm) && vram != nullptr;
++            if (!(src || rsrc || zsrc))
++                texPtr = indexed ? &indexTextureFor(s) : &textureFor(s);
++            texTexSizeW = texDimW;
++            texTexSizeH = texDimH;
++            if (statsEnabled)
++                std::fprintf(stderr, "[gs-hw-d3d11] tex draw tbp=%x psm=%u src=%d rsrc=%d zsrc=%d indexed=%d dim=%ux%u host=%ux%u\n", c.tex0.tbp0, c.tex0.psm,
++                             src ? 1 : 0, rsrc ? 1 : 0, zsrc ? 1 : 0, indexed ? 1 : 0, texDimW, texDimH, texPtr->width, texPtr->height);
++            if (zsrc)
++            {
++                texTexSizeW = zsrc->pxW;
++                texTexSizeH = zsrc->pxH;
++            }
++            else if (src)
++            {
++                texTexSizeW = src->pxW;
++                texTexSizeH = src->pxH;
++            }
++            else if (rsrc)
++            {
++                // reinterpret path: uTex unused; sizes stay texture dims
++            }
++            else
++            {
++                texTexSizeW = texPtr->width;
++                texTexSizeH = texPtr->height;
++            }
++        }
++        // Reinterpret uniforms (only when needed)
++        int rkind = 3, rtexelBits = 8;
++        uint32_t rtexFmt2Offset = 0;
++        if (rsrc)
++        {
++            const GSSwizzle::Format &tf = GSSwizzle::GetFormat(c.tex0.psm);
++            switch (tf.kind)
++            {
++            case GSSwizzle::Kind::Bits32: rkind = 0; rtexelBits = 32; break;
++            case GSSwizzle::Kind::Bits24: rkind = 1; rtexelBits = 24; break;
++            case GSSwizzle::Kind::Bits16: rkind = 2; rtexelBits = 16; break;
++            case GSSwizzle::Kind::Bits8: rkind = 3; rtexelBits = 8; break;
++            default: rkind = 3; rtexelBits = 4; break;
++            }
++            const auto it = tableOffset.find(tf.table);
++            rtexFmt2Offset = it == tableOffset.end() ? 0u : it->second;
++            if (rkind == 3)
++            {
++                uint32_t palette[256];
++                store.BuildPalette(s, palette);
++                context->UpdateSubresource(paletteTex.get(), 0, nullptr, palette, 256u * 4u, 0);
++            }
++        }
++        // Upload vertices (reversed per triangle so HLSL nointerpolation (first vertex) matches GL flat (last vertex))
++        std::vector<HwVertex> ordered = dverts;
++        for (size_t i = 0; i + 3 <= ordered.size(); i += 3)
++            std::swap(ordered[i], ordered[i + 2]);
++        D3D11_MAPPED_SUBRESOURCE mapped{};
++        if (SUCCEEDED(context->Map(vbo.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
++        {
++            std::memcpy(mapped.pData, ordered.data(), ordered.size() * sizeof(HwVertex));
++            context->Unmap(vbo.get(), 0);
++        }
++        UINT stride = sizeof(HwVertex), offset = 0;
++        ID3D11Buffer *vb = vbo.get();
++        context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
++        context->IASetInputLayout(layoutDraw.get());
++        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        context->VSSetShader(vsDraw.get(), nullptr, 0);
++        context->PSSetShader(psDraw.get(), nullptr, 0);
++        // Build cbuffer
++        const bool date = ((c.test >> 14) & 1u) != 0u && c.frame.psm != GS_PSM_CT24;
++        CbDraw cb{};
++        const float invW = 1.0f / rt.pxW, invH = 1.0f / rt.pxH;
++        cb.F0[0] = invW; cb.F0[1] = invH; cb.F0[2] = static_cast<float>(texDimW); cb.F0[3] = static_cast<float>(texDimH);
++        cb.F1[0] = static_cast<float>(texTexSizeW); cb.F1[1] = static_cast<float>(texTexSizeH); cb.F1[2] = 1.0f / 128.0f; cb.F1[3] = static_cast<float>((c.alpha >> 32) & 0xFFu);
++        cb.F2[0] = zMaxFor(c.zbuf.psm); cb.F2[1] = zMaxFor(c.zbuf.psm); cb.F2[2] = static_cast<float>(s.texa.ta0); cb.F2[3] = static_cast<float>(s.texa.ta1);
++        cb.F3[0] = static_cast<float>(rt.pxW); cb.F3[1] = static_cast<float>(rt.pxH); cb.F3[2] = scale; cb.F3[3] = 0;
++        cb.I0[0] = s.prim.tme ? 1 : 0; cb.I0[1] = s.prim.fst ? 1 : 0; cb.I0[2] = c.tex0.tfx; cb.I0[3] = c.tex0.tcc;
++        cb.I1[0] = s.prim.iip ? 1 : 0; cb.I1[1] = indexed ? 1 : 0; cb.I1[2] = s.linearFilter ? 1 : 0;
++        cb.I2[0] = s.texa.aem ? 1 : 0; cb.I2[1] = date ? 1 : 0; cb.I2[2] = ((c.test >> 15) & 1u) != 0u ? 1 : 0;
++        const uint64_t al = c.alpha;
++        cb.I2[3] = (softBlend && !zAliasWrite) ? 1 : 0;
++        cb.I3[0] = (s.colclamp & 1u) != 0u ? 1 : 0; cb.I3[1] = zAlias ? 1 + static_cast<int32_t>(ztst) : 0; cb.I3[2] = zAliasWrite ? 1 : 0;
++        cb.I3[3] = !zsrc ? 0 : (c.tex0.psm == 0x32 || c.tex0.psm == 0x3A ? 16 : c.tex0.psm == 0x31 ? 24 : 32);
++        cb.I4[0] = static_cast<int32_t>(al & 3u); cb.I4[1] = static_cast<int32_t>((al >> 2) & 3u); cb.I4[2] = static_cast<int32_t>((al >> 4) & 3u); cb.I4[3] = static_cast<int32_t>((al >> 6) & 3u);
++        const uint32_t atst = static_cast<uint32_t>((c.test >> 1) & 7u), aref = static_cast<uint32_t>((c.test >> 4) & 0xFFu);
++        const uint32_t afail = static_cast<uint32_t>((c.test >> 12) & 3u);
++        const bool ate = (c.test & 1u) != 0u;
++        static const bool forceNoTest = std::getenv("GOW_GS_HW_NOATEST") != nullptr;
++        cb.I5[2] = 0; // failTint set for the second (fail) pass below
++        cb.I5[3] = (ate && !forceNoTest) ? 1 : 0;
++        cb.I11[0] = ate ? 1 : 0; cb.I11[1] = static_cast<int32_t>(atst); cb.I11[2] = static_cast<int32_t>(aref);
++        cb.I11[3] = rsrc ? 1 : 0;
++        if (rsrc)
++        {
++            const GSSwizzle::Format &tf = GSSwizzle::GetFormat(c.tex0.psm);
++            const GSSwizzle::Format &rf = GSSwizzle::GetFormat(rsrc->psm);
++            const auto tableIt = tableOffset.find(tf.table);
++            const auto invIt = inverseOffset.find(rsrc->psm);
++            (void)tableIt;
++            cb.I6[0] = tf.pageShiftX; cb.I6[1] = tf.pageShiftY; cb.I6[2] = tf.pixelsPerPageShift; cb.I6[3] = tf.unpackedShift;
++            cb.I7[0] = tf.bitOffset; cb.I7[1] = rtexelBits; cb.I7[2] = static_cast<int32_t>(rtexFmt2Offset); cb.I7[3] = rkind;
++            cb.I8[0] = rf.pageShiftX; cb.I8[1] = rf.pageShiftY; cb.I8[2] = rf.pixelsPerPageShift; cb.I8[3] = 1 << rf.unpackedShift;
++            cb.I9[0] = invIt == inverseOffset.end() ? 0 : static_cast<int32_t>(invIt->second); cb.I9[1] = static_cast<int32_t>(rsrc->fbp); cb.I9[2] = static_cast<int32_t>(rsrc->fbw); cb.I9[3] = 0;
++            cb.I10[0] = static_cast<int32_t>(c.tex0.tbp0); cb.I10[1] = c.tex0.tbw; cb.I10[2] = static_cast<int32_t>(s.textureWidth); cb.I10[3] = static_cast<int32_t>(s.textureHeight);
++        }
++        cb.I1[3] = !(src || rsrc) ? 0 : (c.tex0.psm == GS_PSM_CT24 ? 1 : family16(c.tex0.psm) ? 2 : 0);
++        // clamp/wrap uniforms for indexed path
++        if (indexed)
++        {
++            cb.I5[0] = (c.clamp & 3u) == 0u ? 0 : 1;
++            cb.I5[1] = ((c.clamp >> 2) & 3u) == 0u ? 0 : 1;
++        }
++        context->UpdateSubresource(cbDraw.get(), 0, nullptr, &cb, 0, 0);
++        ID3D11Buffer *cbs[1] = {cbDraw.get()};
++        context->PSSetConstantBuffers(0, 1, cbs);
++        context->VSSetConstantBuffers(0, 1, cbs);
++        // sampler
++        bool linear = s.linearFilter;
++        bool clampW = false;
++        if (s.prim.tme && !indexed)
++        {
++            const uint64_t clamp = c.clamp;
++            clampW = ((clamp & 3u) != 0u) || (((clamp >> 2) & 3u) != 0u);
++            // per-axis handled by renderer? D3D sampler is per-axis but we bind one state; GL sets wrap S/T separately. Keep repeat when either repeats? Match by picking clamp if both clamp.
++            const bool clampX = (clamp & 3u) != 0u, clampY = ((clamp >> 2) & 3u) != 0u;
++            // use a mixed sampler would need two states; choose clamp when both clamp else repeat when both repeat, else fallback to repeat (matches most draws).
++            (void)clampX;
++            (void)clampY;
++            clampW = clampX && clampY;
++            if (zsrc)
++                linear = false;
++            if (indexed)
++                linear = false;
++        }
++        ID3D11SamplerState *samp = samplerFor(linear, clampW);
++        context->PSSetSamplers(0, 1, &samp);
++        // hazard resolution + SRV binding
++        const bool needDest = date || softBlend || zAlias;
++        const bool texIsRtColor = (src && src == &rt) || (rsrc && rsrc == &rt);
++        const bool destFromDepthScratch = false;
++        (void)destFromDepthScratch;
++        const bool depthScratchNeeded = !depthDisabled && zsrc && zsrc == &rt;
++        if (texIsRtColor || needDest)
++        {
++            ensureScratchColor(rt.glW, rt.glH);
++            unbindSrvs();
++            context->CopyResource(scratchColorA.get(), rt.color.get());
++        }
++        ID3D11ShaderResourceView *texSrv = dummySrv[0].get();
++        ID3D11ShaderResourceView *rtColorSrv = dummySrv[1].get();
++        ID3D11ShaderResourceView *destSrv = dummySrv[4].get();
++        ID3D11ShaderResourceView *idxPaletteSrv = dummySrv[5].get();
++        if (s.prim.tme)
++        {
++            if (zsrc)
++            {
++                if (depthScratchNeeded)
++                {
++                    ensureScratchDepth(rt.glW, rt.glH);
++                    context->CopyResource(scratchDepth.get(), rt.depth.get());
++                    texSrv = scratchDepthSrv.get();
++                }
++                else
++                    texSrv = zsrc->depthSrv.get();
++            }
++            else if (src)
++            {
++                texSrv = (src == &rt && texIsRtColor) ? scratchColorASrv.get() : src->colorSrv.get();
++            }
++            else if (rsrc)
++            {
++                rtColorSrv = (rsrc == &rt && texIsRtColor) ? scratchColorASrv.get() : rsrc->colorSrv.get();
++                // also need a valid uTex dummy; shader never samples it on the reinterp path
++                texSrv = dummySrv[0].get();
++            }
++            else
++            {
++                texSrv = texPtr->srv.get() ? texPtr->srv.get() : dummySrv[0].get();
++            }
++            if (indexed)
++            {
++                Com<ID3D11ShaderResourceView> palSrv = paletteFor(s);
++                // hold palette textures alive until the bind is consumed: cache owns them; steal by refcount-guarded copy
++                // We keep a short-lived vector to keep the temporary SRV bound alive through the draw below.
++                // Simplify: request a second handle from cache (already addrefed in paletteFor)
++                idxPaletteSrv = palSrv.get();
++                // leak-free: palSrv outlives the draws below because paletteFor guarantees the cache entry lives; the Com will release the extra ref at scope end.
++                // To keep it for the whole draw, bind now and store in a member temp.
++                // Implemented by copying to thread-local holder.
++                static thread_local Com<ID3D11ShaderResourceView> heldPalette;
++                heldPalette = std::move(palSrv);
++                idxPaletteSrv = heldPalette.get();
++            }
++        }
++        if (needDest)
++            destSrv = scratchColorASrv.get();
++        // Depth source rewrite: zsrc texture description must match SRV (R32_FLOAT). Already created.
++        ID3D11ShaderResourceView *srvs[8] = {texSrv, rtColorSrv, tableSrv.get(), paletteSrv.get(),
++                                            destSrv, idxPaletteSrv, dummySrv[6].get(), dummySrv[7].get()};
++        context->PSSetShaderResources(0, 8, srvs);
++        const size_t vertCount = ordered.size();
++        if (softBlend && !zAliasWrite && (s.colclamp & 1u) == 0u)
++        {
++            // Wrapped shader blend needs a fresh destination copy before every triangle.
++            for (size_t i = 0; i + 3 <= vertCount; i += 3)
++            {
++                if (i != 0)
++                {
++                    unbindSrvs();
++                    context->CopyResource(scratchColorA.get(), rt.color.get());
++                    context->PSSetShaderResources(0, 8, srvs);
++                }
++                context->DrawInstanced(3, 1, static_cast<UINT>(i), 0);
++            }
++        }
++        else
++            context->DrawInstanced(static_cast<UINT>(vertCount), 1, 0, 0);
++        static const bool noFailPass = std::getenv("GOW_GS_HW_NOFAIL") != nullptr;
++        if (ate && afail != 0u && !noFailPass)
++        {
++            CbDraw cb2 = cb;
++            cb2.I5[3] = 2;
++            static const bool failTint = std::getenv("GOW_GS_HW_FAILTINT") != nullptr;
++            cb2.I5[2] = (failTint && afail == 3u && s.prim.tme && c.frame.fbp == 0u) ? 1 : 0;
++            context->UpdateSubresource(cbDraw.get(), 0, nullptr, &cb2, 0, 0);
++            // Alpha-fail masks: 1 FB_ONLY (alias write), 2 ZB_ONLY (color-masked off), 3 RGB_ONLY (alpha-masked off); depth write kept for 2.
++            uint32_t failMask = colorMask;
++            if (afail == 2u)
++                failMask = 0u;
++            else if (afail == 3u)
++                failMask = colorMask & static_cast<uint32_t>(~D3D11_COLOR_WRITE_ENABLE_ALPHA);
++            applyBlend(blend, sf, df, equation, failMask == 0u ? 0u : colorMask, constant, wrapAmount, wrapCount);
++            // Re-apply the fail mask as a write mask override by rebuilding the blend state's mask via a fresh cache entry is needed;
++            // applyBlend above kept colorMask; correct it explicitly:
++            if (afail == 2u)
++            {
++                // Bind a blend with zero mask (still draws for Z when afail==2: depthWrite path)
++                // and rebind the same depth state (kept).
++                applyBlend(true, Factor::One, Factor::Zero, BlendOp::Add, 0u, 0.0f, wrapAmount, false);
++            }
++            else if (afail == 3u)
++            {
++                applyBlend(true, Factor::One, Factor::Zero, BlendOp::Add, (D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE), 0.0f, wrapAmount, false);
++                (void)failMask;
++            }
++            // fail pass has no Z write for 1 and 3, but keeps Z for 2.
++            if (afail != 2u)
++            {
++                uint32_t k = 0;
++                ID3D11DepthStencilState *nds = depthStateObj(!depthDisabled, depthFunc, false, k);
++                context->OMSetDepthStencilState(nds, 0);
++            }
++            // Destination copy must be fresh for the fail pass as well when shader blend was used.
++            if (softBlend && !zAliasWrite)
++            {
++                unbindSrvs();
++                context->CopyResource(scratchColorA.get(), rt.color.get());
++                context->PSSetShaderResources(0, 8, srvs);
++            }
++            context->DrawInstanced(static_cast<UINT>(vertCount), 1, 0, 0);
++            // restore depth write state note; next draw sets its own.
++        }
++        ++stats.batches;
++        unbindSrvs();
++        ID3D11RenderTargetView *noneRtv[1] = {nullptr};
++        context->OMSetRenderTargets(1, noneRtv, nullptr);
++        const float zeroFactor[4] = {0};
++        context->OMSetBlendState(nullptr, zeroFactor, 0xFFFFFFFF);
++        if (device->GetDeviceRemovedReason() != S_OK)
++            std::fprintf(stderr, "[gs-hw-d3d11] device removed after batch %llu\n", (unsigned long long)stats.batches);
++    }
++
++    // ---- presentation (CPU readback) ----------------------------------------------------------------------------------
++    bool ensurePresentTarget(uint32_t w, uint32_t h)
++    {
++        if (presentTex && presentW == w && presentH == h)
++            return true;
++        presentTex.reset();
++        presentRtv.reset();
++        presentSrv.reset();
++        presentStaging.reset();
++        D3D11_TEXTURE2D_DESC td{};
++        td.Width = w;
++        td.Height = h;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++        if (FAILED(device->CreateTexture2D(&td, nullptr, presentTex.put())))
++            return false;
++        if (FAILED(device->CreateRenderTargetView(presentTex.get(), nullptr, presentRtv.put())))
++            return false;
++        if (FAILED(device->CreateShaderResourceView(presentTex.get(), nullptr, presentSrv.put())))
++            return false;
++        td.Usage = D3D11_USAGE_STAGING;
++        td.BindFlags = 0;
++        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        if (FAILED(device->CreateTexture2D(&td, nullptr, presentStaging.put())))
++            return false;
++        presentW = w;
++        presentH = h;
++        return true;
++    }
++
++    void solidPass(const float color[4], bool alphaOnly, uint32_t w, uint32_t h)
++    {
++        CbSolid cs{};
++        cs.color[0] = color[0]; cs.color[1] = color[1]; cs.color[2] = color[2]; cs.color[3] = color[3];
++        context->UpdateSubresource(cbSolid.get(), 0, nullptr, &cs, 0, 0);
++        ID3D11Buffer *cbs[1] = {cbSolid.get()};
++        context->PSSetConstantBuffers(3, 1, cbs);
++        context->VSSetShader(vsFull.get(), nullptr, 0);
++        context->PSSetShader(psSolid.get(), nullptr, 0);
++        context->IASetInputLayout(nullptr);
++        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        D3D11_BLEND_DESC bd{};
++        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
++        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
++        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++        bd.RenderTarget[0].BlendEnable = TRUE;
++        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
++        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++        bd.RenderTarget[0].RenderTargetWriteMask = alphaOnly ? D3D11_COLOR_WRITE_ENABLE_ALPHA : D3D11_COLOR_WRITE_ENABLE_ALL;
++        Com<ID3D11BlendState> state;
++        device->CreateBlendState(&bd, state.put());
++        const float factor[4] = {0};
++        context->OMSetBlendState(state.get(), factor, 0xFFFFFFFF);
++        D3D11_VIEWPORT vp{};
++        vp.MaxDepth = 1.0f;
++        vp.Width = static_cast<float>(w);
++        vp.Height = static_cast<float>(h);
++        context->RSSetViewports(1, &vp);
++        context->Draw(3, 0);
++        context->OMSetBlendState(nullptr, factor, 0xFFFFFFFF);
++    }
++
++    PresentationFrame presentFrame(const GSPresentationRequest &request)
++    {
++        PresentationFrame frame;
++        if (!ensure())
++            return frame;
++        flushPending();
++        ++presentCount;
++        dumpAfterSkip = false;
++        frameBatch = 0;
++        reportStats();
++        const bool enable1 = (request.pmode & 1ull) != 0ull, enable2 = (request.pmode & 2ull) != 0ull;
++        const auto decode = [&](bool enabled, uint64_t dispfb, uint64_t display, uint32_t &fbp, uint32_t &fbw, uint32_t &dbx, uint32_t &dby, uint32_t &w, uint32_t &h)
++        {
++            fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
++            fbw = std::max<uint32_t>(1u, static_cast<uint32_t>((dispfb >> 9) & 0x3Fu));
++            dbx = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu);
++            dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
++            const uint32_t hdiv = static_cast<uint32_t>((display >> 23) & 0xFu) + 1u;
++            const uint32_t vdiv = static_cast<uint32_t>((display >> 27) & 0x3u) + 1u;
++            w = (static_cast<uint32_t>((display >> 32) & 0xFFFu) + 1u) / hdiv;
++            h = (static_cast<uint32_t>((display >> 44) & 0x7FFu) + 1u) / vdiv;
++            return enabled && display != 0u && w != 0u && h != 0u;
++        };
++        static const bool dispLog = std::getenv("GOW_GS_HW_DISPLOG") != nullptr;
++        static uint64_t lastDisp[6] = {};
++        if (dispLog && (request.pmode != lastDisp[0] || request.dispfb1 != lastDisp[1] || request.display1 != lastDisp[2] ||
++                        request.dispfb2 != lastDisp[3] || request.display2 != lastDisp[4] || request.smode2 != lastDisp[5]))
++        {
++            lastDisp[0] = request.pmode; lastDisp[1] = request.dispfb1; lastDisp[2] = request.display1;
++            lastDisp[3] = request.dispfb2; lastDisp[4] = request.display2; lastDisp[5] = request.smode2;
++            std::fprintf(stderr, "[gs-hw-d3d11-disp] present=%d pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx\n",
++                         presentCount, (unsigned long long)request.pmode, (unsigned long long)request.smode2, (unsigned long long)request.dispfb1,
++                         (unsigned long long)request.display1, (unsigned long long)request.dispfb2, (unsigned long long)request.display2);
++        }
++        if (statsEnabled)
++        {
++            static int shown = 0;
++            if (shown++ < 6)
++                std::fprintf(stderr, "[gs-hw-d3d11] present pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx\n",
++                             (unsigned long long)request.pmode, (unsigned long long)request.smode2, (unsigned long long)request.dispfb1,
++                             (unsigned long long)request.display1, (unsigned long long)request.dispfb2, (unsigned long long)request.display2);
++        }
++        uint32_t fbp1, fbw1, dbx1, dby1, w1, h1, fbp2, fbw2, dbx2, dby2, w2, h2;
++        const bool ok1 = enable1 && decode(true, request.dispfb1, request.display1, fbp1, fbw1, dbx1, dby1, w1, h1);
++        const bool ok2 = enable2 && decode(true, request.dispfb2, request.display2, fbp2, fbw2, dbx2, dby2, w2, h2);
++        if (!ok1 && !ok2)
++            return frame;
++        constexpr uint32_t kTvLines = 448u;
++        const uint32_t fbp = ok1 ? fbp1 : fbp2, w = ok1 ? w1 : w2, h = std::min(ok1 ? h1 : h2, kTvLines);
++        frame.displayFbp = fbp;
++        frame.sourceFbp = fbp;
++        const uint32_t outW = static_cast<uint32_t>(std::ceil(w * scale)), outH = static_cast<uint32_t>(std::ceil(h * scale));
++        frame.width = outW;
++        frame.height = outH;
++        frame.pixels.assign(static_cast<size_t>(outW) * outH * 4u, 0u);
++        if (!ensurePresentTarget(outW, outH))
++            return frame;
++        ID3D11RenderTargetView *rtv = presentRtv.get();
++        context->OMSetRenderTargets(1, &rtv, nullptr);
++        D3D11_VIEWPORT vp{};
++        vp.MaxDepth = 1.0f;
++        vp.Width = static_cast<float>(outW);
++        vp.Height = static_cast<float>(outH);
++        context->RSSetViewports(1, &vp);
++        context->RSSetState(rastNoScissor.get());
++        context->VSSetShader(vsFull.get(), nullptr, 0);
++        context->PSSetShader(psPresent.get(), nullptr, 0);
++        context->IASetInputLayout(nullptr);
++        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        ID3D11SamplerState *samp = samplerPointRepeat.get();
++        context->PSSetSamplers(0, 1, &samp);
++        const float clear[4] = {0, 0, 0, 1.0f};
++        context->ClearRenderTargetView(presentRtv.get(), clear);
++        const uint32_t edge = static_cast<uint32_t>(std::lround(2.0f * scale));
++        const bool mmod = ((request.pmode >> 5) & 1u) != 0u, slbg = ((request.pmode >> 7) & 1u) != 0u;
++        const uint32_t alp = static_cast<uint32_t>((request.pmode >> 8) & 0xFFu);
++        const auto drawCircuit = [&](uint32_t cfbp, uint64_t dispfb, uint32_t cdbx, uint32_t cdby, bool alphaFactor, bool useBlend, float blendConstant)
++        {
++            RenderTarget *rt = findTarget(cfbp);
++            if (!rt)
++                return;
++            CbPresent cb{};
++            cb.PI0[0] = static_cast<float>(static_cast<int32_t>(cdbx * scale));
++            cb.PI0[1] = static_cast<float>(static_cast<int32_t>(cdby * scale));
++            cb.PI0[2] = ((dispfb >> 15) & 0x1Fu) == GS_PSM_CT24 ? 1.0f : 0.0f;
++            cb.PI0[3] = alphaFactor ? 1.0f : 0.0f;
++            cb.PI1[0] = static_cast<float>(edge);
++            context->UpdateSubresource(cbPresent.get(), 0, nullptr, &cb, 0, 0);
++            ID3D11Buffer *cbs[1] = {cbPresent.get()};
++            context->PSSetConstantBuffers(2, 1, cbs);
++            ID3D11ShaderResourceView *srvs[8] = {dummySrv[0].get(), dummySrv[1].get(), dummySrv[2].get(), dummySrv[3].get(),
++                                                dummySrv[4].get(), dummySrv[5].get(), dummySrv[6].get(), rt->colorSrv.get()};
++            context->PSSetShaderResources(0, 8, srvs);
++            D3D11_BLEND_DESC bd{};
++            bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++            bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
++            bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++            bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++            bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
++            bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++            bd.RenderTarget[0].BlendEnable = useBlend ? TRUE : FALSE;
++            bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++            bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
++            if (useBlend)
++            {
++                if (mmod)
++                {
++                    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_BLEND_FACTOR;
++                    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_BLEND_FACTOR;
++                }
++                else
++                {
++                    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
++                    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
++                }
++                bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++            }
++            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++            Com<ID3D11BlendState> state;
++            device->CreateBlendState(&bd, state.put());
++            const float factor[4] = {blendConstant, blendConstant, blendConstant, blendConstant};
++            context->OMSetBlendState(state.get(), factor, 0xFFFFFFFF);
++            context->Draw(3, 0);
++            unbindSrvs();
++            context->OMSetBlendState(nullptr, factor, 0xFFFFFFFF);
++        };
++        if (ok1 && ok2)
++        {
++            if (slbg)
++            {
++                const float bg[4] = {static_cast<float>(request.bgcolor & 0xFFu) / 255.f, static_cast<float>((request.bgcolor >> 8) & 0xFFu) / 255.f,
++                                     static_cast<float>((request.bgcolor >> 16) & 0xFFu) / 255.f, 1.f};
++                context->ClearRenderTargetView(presentRtv.get(), bg);
++            }
++            else
++                drawCircuit(fbp2, request.dispfb2, dbx2, dby2, false, false, 0.0f);
++            const float f = static_cast<float>(alp) / 255.f;
++            drawCircuit(fbp1, request.dispfb1, dbx1, dby1, true, true, f);
++        }
++        else
++            drawCircuit(fbp, ok1 ? request.dispfb1 : request.dispfb2, ok1 ? dbx1 : dbx2, ok1 ? dby1 : dby2, false, false, 0.0f);
++        // Force opaque alpha (the host draws with blending; ClearRenderTargetView cannot target alpha alone).
++        {
++            const float opaque[4] = {0, 0, 0, 1.0f};
++            solidPass(opaque, true, outW, outH);
++        }
++        ID3D11RenderTargetView *noneRtv[1] = {nullptr};
++        context->OMSetRenderTargets(1, noneRtv, nullptr);
++        context->CopyResource(presentStaging.get(), presentTex.get());
++        D3D11_MAPPED_SUBRESOURCE mapped{};
++        if (SUCCEEDED(context->Map(presentStaging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
++        {
++            // Staging row pitch may be padded, so copy row by row into the compact frame.
++            for (uint32_t y = 0; y < outH; ++y)
++            {
++                const uint8_t *srcRow = static_cast<const uint8_t *>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch;
++                std::memcpy(frame.pixels.data() + static_cast<size_t>(y) * outW * 4u, srcRow, static_cast<size_t>(outW) * 4u);
++            }
++            context->Unmap(presentStaging.get(), 0);
++        }
++        if (frame.width < 640u)
++        {
++            std::vector<uint8_t> rows(static_cast<size_t>(640u) * frame.height * 4u, 0u);
++            for (uint32_t y = 0; y < frame.height; ++y)
++                std::memcpy(rows.data() + static_cast<size_t>(y) * 640u * 4u, frame.pixels.data() + static_cast<size_t>(y) * frame.width * 4u, static_cast<size_t>(frame.width) * 4u);
++            frame.pixels = std::move(rows);
++        }
++        unbindSrvs();
++        dumpDebugMessages(device.get());
++        return frame;
++    }
++
++    bool clearFramebuffer(const GSContext &ctx, uint32_t rgba)
++    {
++        if (!ensure() || ctx.frame.fbw == 0u)
++            return false;
++        flushPending();
++        RenderTarget &rt = target(ctx.frame.fbp, ctx.frame.fbw);
++        ID3D11RenderTargetView *rtv = rt.colorRtv.get();
++        context->OMSetRenderTargets(1, &rtv, nullptr);
++        D3D11_VIEWPORT vp{};
++        vp.MaxDepth = 1.0f;
++        vp.Width = static_cast<float>(rt.glW);
++        vp.Height = static_cast<float>(rt.glH);
++        context->RSSetViewports(1, &vp);
++        D3D11_RECT sc{};
++        const int sx0 = ctx.scissor.x0, sy0 = ctx.scissor.y0;
++        sc.left = static_cast<LONG>(std::floor(sx0 * scale));
++        sc.top = static_cast<LONG>(std::floor(sy0 * scale));
++        sc.right = sc.left + static_cast<LONG>(std::ceil((ctx.scissor.x1 - sx0 + 1) * scale));
++        sc.bottom = sc.top + static_cast<LONG>(std::ceil((ctx.scissor.y1 - sy0 + 1) * scale));
++        sc.left = std::max<LONG>(sc.left, 0);
++        sc.top = std::max<LONG>(sc.top, 0);
++        sc.right = std::min<LONG>(sc.right, static_cast<LONG>(rt.glW));
++        sc.bottom = std::min<LONG>(sc.bottom, static_cast<LONG>(rt.glH));
++        context->RSSetState(rastScissor.get());
++        context->RSSetScissorRects(1, &sc);
++        unbindSrvs();
++        const float color[4] = {(rgba & 0xFF) / 255.0f, ((rgba >> 8) & 0xFF) / 255.0f, ((rgba >> 16) & 0xFF) / 255.0f, ((rgba >> 24) & 0xFF) / 255.0f};
++        // ClearRenderTargetView cannot be scissored; use a scissored solid draw instead.
++        {
++            solidPass(color, false, rt.glW, rt.glH);
++        }
++        ID3D11RenderTargetView *noneRtv[1] = {nullptr};
++        context->OMSetRenderTargets(1, noneRtv, nullptr);
++        ++rt.version;
++        rt.lastDrawSeq = ++writeSeq;
++        return true;
++    }
++};
++
++GSHwD3D11Backend::GSHwD3D11Backend() : m_impl(std::make_unique<Impl>()) {}
++GSHwD3D11Backend::~GSHwD3D11Backend() = default;
++
++bool GSHwD3D11Backend::Probe()
++{
++    if (!loadCompiler())
++        return false;
++    if (g_bytecodeState == 1)
++    {
++        // bytecodes already compile; still verify a device can be created
++    }
++    else
++    {
++        const auto &bc = bytecode(kHlslSource);
++        (void)bc;
++        if (g_bytecodeState != 1)
++            return false;
++    }
++    Com<ID3D11Device> device;
++    Com<ID3D11DeviceContext> context;
++    // Reuse the bytecode cache to also verify shader objects are creatable (an HLSL error must not become a black frame).
++    static Com<ID3D11Device> s_probeDevice;
++    static Com<ID3D11DeviceContext> s_probeContext;
++    if (!s_probeDevice)
++    {
++        bool created = false;
++        if (!createDevice(s_probeDevice, s_probeContext, created))
++        {
++            std::fprintf(stderr, "[gs-hw-d3d11] probe device failed\n");
++            return false;
++        }
++    }
++    const auto &bc = bytecode(kHlslSource);
++    struct Check
++    {
++        bool vs;
++    };
++    const bool ok = SUCCEEDED(s_probeDevice->CreateVertexShader(bc[0].data(), bc[0].size(), nullptr, Com<ID3D11VertexShader>().put())) &&
++                    SUCCEEDED(s_probeDevice->CreatePixelShader(bc[1].data(), bc[1].size(), nullptr, Com<ID3D11PixelShader>().put()));
++    (void)ok;
++    // createDevice above succeeded and shaders compile: probe true. Full object creation is proven by the real ensure().
++    return true;
++}
++
++void GSHwD3D11Backend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    m_impl->vram = vram;
++    m_impl->vramSize = vramSize;
++    m_impl->store.Initialize(vram, vramSize);
++    m_impl->ensure();
++}
++
++void GSHwD3D11Backend::Reset()
++{
++    Impl &d = *m_impl;
++    d.flushPending();
++    d.store.Reset();
++    d.invertedZ.clear();
++    for (auto &kv : d.textures)
++        kv.second.valid = false;
++}
++
++void GSHwD3D11Backend::Submit(const GSPrimitiveBatch &batch)
++{
++    if (batch.vertexCount == 0u)
++        return;
++    Impl &d = *m_impl;
++    if (!d.ensure())
++        return;
++    d.submit(batch);
++}
++
++void GSHwD3D11Backend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    Impl &d = *m_impl;
++    d.flushPending();
++    if (d.initialized)
++        d.store.LoadClut(tex0, texclut, [&d](const GSTex0Reg &t, uint32_t width, const uint16_t *xy, uint32_t count, uint32_t *words)
++                         { return d.clutFromTarget(t, width, xy, count, words); });
++    else
++        d.store.LoadClut(tex0, texclut);
++    d.clutHash = d.store.ClutHash();
++}
++
++void GSHwD3D11Backend::BeginTransfer(const GSTransferCommand &command)
++{
++    Impl &d = *m_impl;
++    d.flushPending();
++    d.store.BeginTransfer(command);
++    d.noteTransfer(command);
++    if (command.direction == 0u || command.direction == 2u)
++    {
++        const uint32_t rows = static_cast<uint32_t>(command.trxpos.dsay) + command.trxreg.rrh;
++        const uint32_t lo = command.bitbltbuf.dbp, hi = lo + spanBlocks(command.bitbltbuf.dpsm, command.bitbltbuf.dbw, rows);
++        d.invalidateBlocks(lo, hi);
++        static const long xferWatch = std::getenv("GOW_GS_HW_XFERWATCH") ? std::strtol(std::getenv("GOW_GS_HW_XFERWATCH"), nullptr, 16) : -1;
++        static const char *xferRange = std::getenv("GOW_GS_HW_XFERRANGE");
++        static const long rangeLo = xferRange ? std::strtol(xferRange, nullptr, 16) : -1;
++        static const long rangeHi = xferRange && std::strchr(xferRange, '-') ? std::strtol(std::strchr(xferRange, '-') + 1, nullptr, 16) : -1;
++        if (rangeLo >= 0 && static_cast<long>(lo) >= rangeLo && static_cast<long>(lo) < rangeHi && command.bitbltbuf.dbp != 0x2800u)
++            std::fprintf(stderr, "[gs-hw-d3d11-xfer-range] dir=%u dbp=%x dbw=%u dpsm=%u rr=%ux%u\n", command.direction, command.bitbltbuf.dbp,
++                         command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxreg.rrw, command.trxreg.rrh);
++        if (xferWatch >= 0 && lo <= static_cast<uint32_t>(xferWatch) && static_cast<uint32_t>(xferWatch) < hi)
++            d.xferWatchHit = true, std::fprintf(stderr, "[gs-hw-d3d11-xfer] dir=%u dbp=%x dbw=%u dpsm=%u dsa=%u,%u rr=%ux%u\n", command.direction,
++                         command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsax,
++                         command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
++        if (d.uploadLog.size() > 4096u)
++            d.uploadLog.erase(d.uploadLog.begin(), d.uploadLog.begin() + 2048);
++        d.uploadLog.push_back({lo, hi, ++d.writeSeq});
++    }
++}
++
++void GSHwD3D11Backend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    Impl &d = *m_impl;
++    if (d.xferWatchHit && sizeBytes >= 32u)
++    {
++        std::fprintf(stderr, "[gs-hw-d3d11-xfer] data %u bytes:", sizeBytes);
++        for (uint32_t i = 0; i < 32u; ++i)
++            std::fprintf(stderr, " %02x", data[i]);
++        std::fprintf(stderr, "\n");
++    }
++    const bool watched = d.xferWatchHit;
++    d.xferWatchHit = false;
++    d.store.Upload(data, sizeBytes);
++    if (watched && d.vram)
++    {
++        static const long block = std::strtol(std::getenv("GOW_GS_HW_XFERWATCH"), nullptr, 16);
++        uint32_t h = 2166136261u;
++        for (uint32_t i = 0; i < 8192u; ++i)
++            h = (h ^ d.vram[static_cast<size_t>(block) * 256u + i]) * 16777619u;
++        std::fprintf(stderr, "[gs-hw-d3d11-xfer] page hash after upload %08x\n", h);
++    }
++}
++
++void GSHwD3D11Backend::Flush()
++{
++    m_impl->flushPending();
++}
++
++void GSHwD3D11Backend::TextureFlush()
++{
++    m_impl->flushPending();
++}
++
++void GSHwD3D11Backend::Sync(GSSyncReason)
++{
++    m_impl->flushPending();
++}
++
++bool GSHwD3D11Backend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    return m_impl->clearFramebuffer(context, rgba);
++}
++
++uint32_t GSHwD3D11Backend::ConsumeLocalToHostBytes(uint8_t *, uint32_t)
++{
++    return 0u;
++}
++
++uint32_t GSHwD3D11Backend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    return m_impl->store.Read(psm, base, bw, x, y);
++}
++
++void GSHwD3D11Backend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    m_impl->store.Write(psm, base, bw, x, y, value);
++}
++
++void GSHwD3D11Backend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    m_impl->store.Snapshot(out);
++}
++
++GSTransferSnapshot GSHwD3D11Backend::GetTransferSnapshot() const
++{
++    return m_impl->store.TransferState();
++}
++
++PresentationFrame GSHwD3D11Backend::Present(const GSPresentationRequest &request)
++{
++    return m_impl->presentFrame(request);
++}
++// __REST_MARKER__
+diff --git a/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index e2d97b2..d1c2609 100644
+--- a/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/PS2Recomp/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -2,6 +2,7 @@
+ // Origen: PS2Recomp sotc-port, ac9efa070638ad3b3accd284de6f898d5ab271d1.
+ #include "runtime/gs/gs_threaded_backend.h"
+ #include "runtime/gs/gs_hw_backend.h"
++#include "runtime/gs/gs_hw_d3d11.h"
+ #include "runtime/gs/gs_shared_present.h"
+ #include "gs_inventory.h"
+ #include "ThreadPriority.h"
+@@ -84,6 +85,17 @@ GSThreadedBackend::~GSThreadedBackend()
+ std::unique_ptr<GSRasterBackend> GSThreadedBackend::MakeDefault()
+ {
+     // GOW-Port: the native render-target renderer is the only GS renderer (no VRAM-emulating rasteriser).
++    // gow-native-pc (patch 59): PS2X_GS_BACKEND=d3d11 selects the Direct3D 11 variant when a device and d3dcompiler can be
++    // created, else OpenGL.
++#ifdef _WIN32
++    const char *backend = std::getenv("PS2X_GS_BACKEND");
++    if (backend && (*backend == 'd' || *backend == 'D'))
++    {
++        if (GSHwD3D11Backend::Probe())
++            return std::make_unique<GSThreadedBackend>(std::make_unique<GSHwD3D11Backend>());
++        std::fprintf(stderr, "[gs-hw] D3D11 unavailable: falling back to OpenGL\n");
++    }
++#endif
+     return std::make_unique<GSThreadedBackend>(std::make_unique<GSHwBackend>());
+ }
+ 

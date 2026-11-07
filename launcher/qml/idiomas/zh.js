@@ -82,6 +82,8 @@ var textos = {
     nitidez: "锐度",
     nitidezDesc: "双三次滤镜的锐化强度（0 = 不锐化）。",
     fxaa: "抗锯齿（FXAA）",
+    renderizador: "图形 API",
+    renderizadorDesc: "默认使用 OpenGL。Direct3D 11（实验性）在部分 Windows GPU 上可能表现更好；若不可用，游戏会回退到 OpenGL。重启游戏后生效。",
     anisotropico: "各向异性过滤",
     anisotropicoDesc: "斜看时的纹理更清晰（地面、墙壁）；GPU 开销很小。",
     desactivado: "关闭",

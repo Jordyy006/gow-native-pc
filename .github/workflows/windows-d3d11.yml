@@ -1,0 +1,41 @@
+name: Windows build (Direct3D 11 renderer)
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Launcher language files
+        run: python -I tools/test/launcher-languages.py
+      - name: Pinned tools, runtime checkout and patch chain (01 to 59)
+        shell: pwsh
+        run: ./tools/pipeline/build.ps1 -Stages tools,fetch
+      - name: Compile the Direct3D 11 renderer with the pinned Clang
+        shell: pwsh
+        run: |
+          $clang = (Get-ChildItem data/_tools -Recurse -Filter clang++.exe | Select-Object -First 1).FullName
+          if (-not $clang) { throw 'pinned clang++ not found under data/_tools' }
+          $bin = Split-Path $clang
+          $env:PATH = "$bin;$env:PATH"
+          $rx = (Resolve-Path engine/runtime/PS2Recomp/ps2xRuntime).Path
+          $inc = @("-I$rx/include", "-I$rx/src/lib/Kernel", "-I$rx/src/lib/gs", "-I$rx/src/lib/gs/gpu")
+          $flags = @('-std=gnu++20', '-march=x86-64-v2', '-O1', '-w', '-DPS2X_HAS_FFMPEG=0')
+          $outDir = New-Item -ItemType Directory -Force data/_ci
+          foreach ($src in 'src/lib/gs/gpu/gs_hw_d3d11.cpp', 'src/lib/gs/gs_threaded_backend.cpp') {
+            Write-Host "compile $src"
+            & $clang @flags @inc -c "$rx/$src" -o "$outDir/$([IO.Path]::GetFileNameWithoutExtension($src)).o"
+            if ($LASTEXITCODE -ne 0) { throw "compile failed: $src" }
+          }
+          Write-Host 'link + run the headless D3D11 test (WARP software device: the runner has no GPU)'
+          & $clang @flags @inc tools/test/d3d11_backend_test.cpp "$rx/src/lib/gs/gpu/gs_hw_d3d11.cpp" "$rx/src/lib/gs/gpu/gs_texture_store.cpp" "$rx/src/lib/gs/gs_swizzle.cpp" "$rx/src/lib/gs/ps2_gs_memory.cpp" -ld3d11 -o "$outDir/d3d11_backend_test.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'test link failed' }
+          $env:GOW_GS_D3D11_WARP = '1'
+          & "$outDir/d3d11_backend_test.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Direct3D 11 test failed' }

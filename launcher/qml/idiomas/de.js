@@ -82,6 +82,8 @@ var textos = {
     nitidez: "Schärfe",
     nitidezDesc: "Stärke der Schärfung des bikubischen Filters (0 = keine).",
     fxaa: "Kantenglättung (FXAA)",
+    renderizador: "Grafik-API",
+    renderizadorDesc: "OpenGL ist der Standard. Direct3D 11 (experimentell) läuft auf manchen Windows-GPUs besser; ist es nicht verfügbar, fällt das Spiel auf OpenGL zurück. Zum Anwenden das Spiel neu starten.",
     anisotropico: "Anisotrope Filterung",
     anisotropicoDesc: "Schärfere Texturen im schrägen Blickwinkel (Böden, Wände); geringe GPU-Kosten.",
     desactivado: "Aus",

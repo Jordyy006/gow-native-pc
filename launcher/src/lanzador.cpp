@@ -491,6 +491,14 @@ bool Lanzador::iniciar(const QVariantMap &a)
         entorno.insert(QStringLiteral("GOW_ANISO"), QString::number(aniso));
     else
         entorno.remove(QStringLiteral("GOW_ANISO"));
+    // GS renderer (patch 59): "d3d11" asks for the Direct3D 11 variant on Windows; anything else keeps OpenGL. The runtime
+    // falls back to OpenGL by itself when no D3D11 device exists.
+#ifdef Q_OS_WIN
+    if (a.value(QStringLiteral("renderizador")).toString() == QStringLiteral("d3d11"))
+        entorno.insert(QStringLiteral("PS2X_GS_BACKEND"), QStringLiteral("d3d11"));
+    else
+#endif
+        entorno.remove(QStringLiteral("PS2X_GS_BACKEND"));
     // Runtime upscaling (gs_host_present.cpp). "fsr" = bicubic with sharpening (GOW_SHARPEN, 0 to 0.5 with
     // the sharpness; 0 = none); "bilineal" and "pixel" = bilinear stretch without sharpening (soft image).
     {

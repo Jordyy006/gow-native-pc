@@ -224,6 +224,19 @@ ScrollView {
             }
         }
         Fila {
+            visible: Qt.platform.os === "windows"
+            titulo: Tema.t("renderizador")
+            descripcion: Tema.t("renderizadorDesc")
+            Selector {
+                opciones: [
+                    { texto: "OpenGL", valor: "opengl" },
+                    { texto: "Direct3D 11", valor: "d3d11" }
+                ]
+                valor: raiz.ajustes.renderizador
+                onElegido: (v) => raiz.ajustes.renderizador = v
+            }
+        }
+        Fila {
             titulo: Tema.t("anisotropico")
             descripcion: Tema.t("anisotropicoDesc")
             Selector {

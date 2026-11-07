@@ -46,6 +46,7 @@ ApplicationWindow {
         property string filtro: "bilineal" // soft image by default
         property real nitidez: 0.8
         property bool fxaa: true
+        property string renderizador: "opengl" // GS renderer on Windows: "opengl" or "d3d11" (PS2X_GS_BACKEND, patch 59)
         property string anisotropico: "1" // anisotropic texture filtering: 1 = off, 2..16 (GOW_ANISO)
         property string resolucionInterna: "2" // "auto" (from the display) or "1".."8" (PS2X_GS_HW_SCALE)
         property int fpsLimite: 120
@@ -246,6 +247,7 @@ ApplicationWindow {
             ancho: ajustes.ancho, alto: ajustes.alto,
             aspecto: ajustes.aspecto, estirar: ajustes.estirar,
             filtro: ajustes.filtro, nitidez: ajustes.nitidez, fxaa: ajustes.fxaa, anisotropico: ajustes.anisotropico,
+            renderizador: ajustes.renderizador,
             escala: escalaElegida(),
             fpsLimite: ajustes.fpsLimite, vsync: ajustes.vsync, mostrarFps: ajustes.mostrarFps,
             elf: elegido.elf, iso: "", ejecutable: elegido.runner,

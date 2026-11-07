@@ -82,6 +82,8 @@ var textos = {
     nitidez: "Netteté",
     nitidezDesc: "Force de l'accentuation du filtre bicubique (0 = aucune).",
     fxaa: "Anticrénelage (FXAA)",
+    renderizador: "API graphique",
+    renderizadorDesc: "OpenGL est l'option par défaut. Direct3D 11 (expérimental) peut mieux fonctionner sur certains GPU Windows ; s'il est indisponible, le jeu revient à OpenGL. Relancez le jeu pour appliquer.",
     anisotropico: "Filtrage anisotrope",
     anisotropicoDesc: "Textures plus nettes vues de biais (sols, murs) ; un léger coût GPU.",
     desactivado: "Désactivé",

@@ -294,7 +294,7 @@ QString SessionDiagnostics::create(const QString &base, const QVariantMap &setti
     QJsonObject selected;
     // Explicit settings allowlist excludes ISO/save paths, key bindings and other personal fields.
     for (const QString &key : {"diagnostics", "framePc", "gpu", "modoPantalla", "ancho", "alto", "escala",
-                               "aspecto", "fxaa", "vsync", "fpsLimite", "filtro", "anisotropico",
+                               "aspecto", "fxaa", "vsync", "fpsLimite", "filtro", "anisotropico", "renderizador",
                                "jitInline", "finAnticipado", "vuRapida", "usarPacoteTexturas", "idioma", "saltarVideos", "arranqueRapido",
                                "qteHold", "qteHoldButtons", "qteHoldRate"})
         if (settings.contains(key)) selected[key] = QJsonValue::fromVariant(settings.value(key));
@@ -414,7 +414,7 @@ int SessionDiagnostics::run(const QStringList &args)
     for (const char *name : {"GOW_PERF_DIAG", "GOW_FRAME_DIAG", "GOW_PERF_FRAME_PC", "GOW_AUDIO", "GOW_AUDIO_STATS", "GOW_IOP_DRIFT",
          "GOW_VU1N_DIAG", "GOW_VU1N_X64", "GOW_VU1X_INLINE", "GOW_DISPATCH_FULL", "GOW_GS_FINISH_ASINCRONO",
          "GOW_VU1_EARLY_FINISH", "GOW_GS_EARLY_FINISH", "GOW_VU1_FAST", "GOW_SYNC_DIAG", "PS2X_GS_WORKER_DIAG", "PS2X_GS_PIPELINE",
-         "PS2X_GS_WORKER", "PS2X_GS_HW_SCALE", "TOBIICHI_VSYNC", "TOBIICHI_VENTANA_FPS", "GOW_QTE_HOLD", "GOW_QTE_HOLD_HZ"})
+         "PS2X_GS_WORKER", "PS2X_GS_HW_SCALE", "PS2X_GS_BACKEND", "TOBIICHI_VSYNC", "TOBIICHI_VENTANA_FPS", "GOW_QTE_HOLD", "GOW_QTE_HOLD_HZ"})
         if (qEnvironmentVariableIsSet(name)) env[name] = redact(qEnvironmentVariable(name).left(128), r.paths);
     r.meta["runtime_environment"] = env;
 #ifdef Q_OS_WIN
