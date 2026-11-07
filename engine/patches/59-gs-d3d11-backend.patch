@@ -9,23 +9,16 @@ Not in this backend yet: PCSX2 texture packs (patch 52) and the GL-only shared p
 tools/test/d3d11_backend_test.cpp. Origin: this project, modelled on the Tenkaichi3Decomp renderer split (gs_d3d11.cpp).
 
 diff --git a/PS2Recomp/ps2xRuntime/CMakeLists.txt b/PS2Recomp/ps2xRuntime/CMakeLists.txt
-index 4564d5c..e2d44d1 100644
+index 4564d5c..5d913d2 100644
 --- a/PS2Recomp/ps2xRuntime/CMakeLists.txt
 +++ b/PS2Recomp/ps2xRuntime/CMakeLists.txt
-@@ -401,6 +401,7 @@ add_library(ps2_runtime STATIC
-     src/lib/gs/gs_swizzle.cpp
-     src/lib/gs/gpu/gs_gl.cpp
-     src/lib/gs/gpu/gs_hw_backend.cpp
-+    src/lib/gs/gpu/gs_hw_d3d11.cpp
- 
- src/lib/gs/gpu/gs_texture_store.cpp
-     src/lib/ps2_iop_host.cpp
-@@ -583,7 +584,8 @@ set_source_files_properties(
+@@ -583,7 +583,9 @@ set_source_files_properties(
  target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg libmpeg2 ps2_iop)
  if(WIN32)
      # GOW-Port: WGL propio del hilo GS.
 -    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
 +    # gow-native-pc (patch 59): d3d11 for the Direct3D 11 GS renderer (PS2X_GS_BACKEND=d3d11); d3dcompiler_47.dll is loaded at run time.
++    target_sources(ps2_runtime PRIVATE src/lib/gs/gpu/gs_hw_d3d11.cpp)
 +    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32 d3d11)
  endif()
  target_link_libraries(ps2EntryRunner
