@@ -8,8 +8,8 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Launcher language files
@@ -34,8 +34,22 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "compile failed: $src" }
           }
           Write-Host 'link + run the headless D3D11 test (WARP software device: the runner has no GPU)'
-          & $clang @flags @inc tools/test/d3d11_backend_test.cpp "$rx/src/lib/gs/gpu/gs_hw_d3d11.cpp" "$rx/src/lib/gs/gpu/gs_texture_store.cpp" "$rx/src/lib/gs/gs_swizzle.cpp" "$rx/src/lib/gs/ps2_gs_memory.cpp" -ld3d11 -o "$outDir/d3d11_backend_test.exe"
+          & $clang @flags @inc tools/test/d3d11_backend_test.cpp "$rx/src/lib/gs/gpu/gs_hw_d3d11.cpp" "$rx/src/lib/gs/gpu/gs_texture_store.cpp" "$rx/src/lib/gs/gs_swizzle.cpp" "$rx/src/lib/gs/ps2_gs_memory.cpp" -ld3d11 -static -o "$outDir/d3d11_backend_test.exe"
           if ($LASTEXITCODE -ne 0) { throw 'test link failed' }
           $env:GOW_GS_D3D11_WARP = '1'
           & "$outDir/d3d11_backend_test.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Direct3D 11 test failed' }
+      - name: Collect the files to download
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item engine/patches/59-gs-d3d11-backend.patch dist/ -ErrorAction SilentlyContinue
+          Copy-Item data/_ci/d3d11_backend_test.exe dist/ -ErrorAction SilentlyContinue
+          Copy-Item data/_ci/gs_hw_d3d11.o, data/_ci/gs_threaded_backend.o dist/ -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: d3d11-windows
+          path: dist/
+          if-no-files-found: warn

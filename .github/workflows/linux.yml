@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Native dependencies
         run: |
           sudo apt-get update
@@ -29,3 +29,15 @@ jobs:
         run: bash build.sh --stages tools,fetch,launcher,runtime-check --jobs 2
       - name: Linux diagnostic collector
         run: python3 -I tools/test/session_diagnostics.py data/build-linux/launcher/gow-session
+      - name: Collect the files to download
+        if: always()
+        run: |
+          mkdir -p dist
+          cp engine/patches/59-gs-d3d11-backend.patch dist/ || true
+          cp data/build-linux/launcher/gow-launcher data/build-linux/launcher/gow-session dist/ || true
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: linux-launcher
+          path: dist/
+          if-no-files-found: warn
