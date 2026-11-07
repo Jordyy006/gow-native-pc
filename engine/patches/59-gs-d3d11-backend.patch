@@ -76,10 +76,10 @@ index 0000000..aca86a3
 +};
 diff --git a/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp b/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp
 new file mode 100644
-index 0000000..ddff2b7
+index 0000000..1b07bf4
 --- /dev/null
 +++ b/PS2Recomp/ps2xRuntime/src/lib/gs/gpu/gs_hw_d3d11.cpp
-@@ -0,0 +1,3264 @@
+@@ -0,0 +1,3263 @@
 +// GOW-Port: Direct3D 11 variant of the native GS renderer (see gs_hw_backend.cpp). Same PS2 draw translation into
 +// scaled RGBA render targets, CPU texture decode and CLUT store reuse; the rasteriser, blend, depth and composition
 +// are D3D11. Selected with PS2X_GS_BACKEND=d3d11; the host always reads the composed frame back.
@@ -2391,7 +2391,6 @@ index 0000000..ddff2b7
 +            D3D11_MAPPED_SUBRESOURCE mapped{};
 +            // Copy quads into the dynamic vertex buffer for this half-group.
 +            ID3D11Buffer *vb = shuffleVbo.get();
-+            context->IASetVertexBuffers(0, 1, &vb, nullptr, nullptr);
 +            if (SUCCEEDED(context->Map(shuffleVbo.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
 +            {
 +                std::memcpy(mapped.pData, q.data(), q.size() * sizeof(ShuffleVertex));
